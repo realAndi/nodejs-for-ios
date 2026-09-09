@@ -1,0 +1,17 @@
+# Cloned by tools/ci.sh so the shared publishing tools are available locally.
+.ci/
+
+# Build output. libnodeshim.dylib is compiled by tools/build-payload.sh on
+# macOS; PAYLOAD.version is written beside it. Neither belongs in git -- an
+# ldid-signed binary is not byte-identical across build hosts, and committing
+# it would mean the repository and the runner could disagree about the shim.
+packaging/payload/libnodeshim.dylib
+packaging/payload/PAYLOAD.version
+
+# Assembled packages and the generated APT index. CI publishes these to Pages.
+repo/debs/*.deb
+repo/Packages*
+repo/Release*
+repo/InRelease
+
+.DS_Store

@@ -1,0 +1,114 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Node.js</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #6b6b6b;
+    --rule: #e5e5e5; --card: #f7f7f6; --accent: #5fa04e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8d96a0;
+            --rule:#30363d; --card:#161b22; --accent:#8cc84b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:20px 18px 40px; background:var(--bg); color:var(--fg);
+         font:16px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+  h1 { font-size:22px; margin:0 0 2px; letter-spacing:-0.01em; }
+  .sub { color:var(--muted); font-size:14px; margin-bottom:22px; }
+  h2 { font-size:15px; text-transform:uppercase; letter-spacing:0.06em;
+       color:var(--muted); margin:26px 0 8px; font-weight:600; }
+  p { margin:0 0 12px; }
+  code { font:13px ui-monospace, SFMono-Regular, Menlo, monospace;
+         background:var(--card); padding:1px 5px; border-radius:4px; }
+  .card { background:var(--card); border:1px solid var(--rule);
+          border-radius:10px; padding:14px 16px; margin:0 0 12px; }
+  .warn { border-left:3px solid var(--accent); }
+  ul { margin:0; padding-left:20px; }
+  li { margin:4px 0; }
+  .k { color:var(--muted); }
+</style>
+
+<h1>Node.js</h1>
+<div class="sub">Current Node with npm, npx and working nvm, patched for iOS</div>
+
+<p>A real, current Node.js on your phone. <code>npm install</code>,
+<code>npx</code>, <code>node:sqlite</code>, WebAssembly, HTTPS and
+<code>nvm install</code> all work.</p>
+
+<h2>What gets installed</h2>
+<div class="card">
+<p>Not a cross-compile. The official <code>darwin-arm64</code> build from
+nodejs.org imports 725 symbols and iOS is missing exactly three of them, so this
+downloads Apple's own build and patches it: the Mach-O is restamped to claim
+platform iOS, the CoreFoundation and Security load paths are rewritten to the
+flat iOS layout, and a 68&nbsp;KB shim is linked in for the rest.</p>
+<p style="margin-bottom:0">The tarball is checked against the SHA-256 this
+package was built against before anything is patched, and the patcher refuses a
+build that links a dylib iOS lacks. About 50&nbsp;MB downloaded,
+220&nbsp;MB installed.</p>
+</div>
+
+<h2>How the JIT works</h2>
+<div class="card">
+<p>iOS rejects <code>MAP_JIT</code> with EINVAL and kills a process that
+executes a writable page, but it will let <code>mprotect</code> swing a page
+between read-write and read-execute. And
+<code>pthread_jit_write_protect_np</code>, the call V8's arm64 Darwin build uses
+to flip its code pages, does not exist on iOS at all.</p>
+<p style="margin-bottom:0">So the shim strips <code>MAP_JIT</code>, remembers
+the region, and implements the flip with <code>mprotect</code>. That is
+process-wide where the real API is per-thread, so the shim also forces V8
+<code>--single-threaded</code> from a library constructor — the one route that
+survives a <code>#!/usr/bin/env node</code> shebang and anything npm spawns.</p>
+</div>
+
+<h2>Repository</h2>
+<div class="card"><p style="margin:0"><code>https://reallyitsandi.com/repo/</code></p></div>
+
+<h2>Using nvm</h2>
+<div class="card">
+<p>Install nvm as usual, then add one line to your shell profile:</p>
+<p><code>. /var/jb/usr/local/lib/node-ios/nodeios.sh</code></p>
+<p style="margin-bottom:0">It fixes nvm's architecture detection — iOS
+<code>uname -m</code> answers the device model, so stock nvm asks nodejs.org for
+a <code>darwin-iPhone16,1</code> build and falls back to a source compile that
+cannot work — and patches each version <code>nvm install</code> brings down.</p>
+</div>
+
+<h2>Requires</h2>
+<ul>
+  <li>A rootless jailbreak (<code>/var/jb</code>) &mdash; tested on Dopamine</li>
+  <li>iOS 15 or later, arm64 &mdash; tested on iOS 17.3 (iPhone 15 Pro)</li>
+  <li>Network at install time, for the ~50&nbsp;MB download</li>
+  <li><span class="k">Depends:</span> zsh, bash, python3, ldid, curl, tar,
+      coreutils — Sileo installs any that are missing.</li>
+</ul>
+
+<h2>Notes</h2>
+<div class="card warn">
+<ul>
+  <li><strong>Node 24 and newer only.</strong> Node 23 and earlier are built
+      with a macOS deployment target of 11.0, so the linker emits classic
+      <code>LC_DYLD_INFO_ONLY</code> bind opcodes rather than chained fixups,
+      and this port has no opcode rewriter. <code>nvm install 22</code> will
+      download and then fail to patch.</li>
+  <li><strong><code>worker_threads</code> is reliable up to two workers.</strong>
+      Past that the process-wide W^X flip races a worker isolate compiling
+      against the main isolate executing, and the process takes SIGBUS. For
+      worker-heavy work run with <code>NODEIOS_V8_FLAGS=--jitless</code>, which
+      is slower but thread-safe. Eight workers pass reliably that way.</li>
+  <li><strong>Native addons need patching too.</strong> A prebuilt
+      <code>.node</code> from npm is a macOS dylib. Run
+      <code>node-ios-patch</code> on it, or expect it to fail to load.</li>
+  <li><code>/bin/sh</code> does not exist on a rootless jailbreak and Node
+      hard-codes it for <code>shell: true</code>. The shim remaps
+      <code>/bin</code>, <code>/usr/bin</code> and friends into
+      <code>/var/jb</code>, but only when the original really is missing.</li>
+  <li>Node's <code>--use-system-ca</code> is inert: the macOS keychain API
+      behind it does not exist on iOS, so the shim reports "no trust settings"
+      and Node keeps its bundled Mozilla roots. Ordinary TLS is unaffected.</li>
+  <li>Replaces <code>io.github.imcynic.nodejs</code> if you have it.</li>
+</ul>
+</div>

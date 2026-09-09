@@ -1,0 +1,77 @@
+#!/var/jb/usr/bin/bash
+# Patch an official macOS arm64 Node.js install so it runs on jailbroken iOS.
+# Point it at an nvm version directory, a Node distribution root, or the node
+# binary itself:
+#
+#   node-ios-patch ~/.nvm/versions/node/v24.21.0
+#   node-ios-patch ./node-v26.8.1-darwin-arm64/bin/node
+#
+# Idempotent: a binary that is already patched is detected and skipped.
+set -euo pipefail
+
+PREFIX="${NODEIOS_PREFIX:-/var/jb}"
+TOOLS="${NODEIOS_TOOLS:-$PREFIX/usr/libexec/node-ios}"
+PATCHER="$TOOLS/nodeios_patch.py"
+SHIM="$TOOLS/libnodeshim.dylib"
+ENTS="$TOOLS/entitlements.plist"
+
+die(){ echo "node-ios-patch: $*" >&2; exit 1; }
+
+[ -f "$PATCHER" ] || die "missing $PATCHER"
+[ -f "$SHIM" ]    || die "missing $SHIM"
+[ -f "$ENTS" ]    || die "missing $ENTS"
+command -v ldid >/dev/null || die "ldid not found (apt install ldid)"
+
+target="${1:-}"
+[ -n "$target" ] || die "usage: node-ios-patch <nvm-version-dir | node-dist-dir | node-binary> | --all"
+
+# --all: patch every nvm-installed version that is not patched yet. This is what
+# the nvm wrapper calls after an install, and it is why the patch has to be
+# idempotent -- it runs over already-patched versions every time.
+if [ "$target" = "--all" ]; then
+  ndir="${NVM_DIR:-$HOME/.nvm}/versions/node"
+  [ -d "$ndir" ] || die "no nvm versions under $ndir"
+  rc=0
+  for v in "$ndir"/*/; do
+    [ -x "$v/bin/node" ] || continue
+    "$0" "$v" || rc=1
+  done
+  exit $rc
+fi
+
+# Resolve to the node binary.
+if [ -d "$target" ]; then
+  if   [ -x "$target/bin/node" ]; then bin="$target/bin/node"
+  elif [ -x "$target/node" ];     then bin="$target/node"
+  else die "no bin/node under $target"; fi
+else
+  bin="$target"
+fi
+[ -f "$bin" ] || die "not a file: $bin"
+
+dir="$(cd "$(dirname "$bin")" && pwd)"
+bin="$dir/$(basename "$bin")"
+
+# Already patched? The shim load command is the marker.
+if otool -l "$bin" 2>/dev/null | grep -q libnodeshim.dylib; then
+  echo "already patched: $bin"
+else
+  # Patch via a temp file in the SAME directory: the replace must be an atomic
+  # rename, and a cross-filesystem move is not one.
+  tmp="$dir/.node-ios-patch.$$"
+  trap 'rm -f "$tmp"' EXIT
+  python3 "$PATCHER" "$bin" "$tmp"
+  chmod --reference="$bin" "$tmp" 2>/dev/null || chmod 755 "$tmp"
+  mv -f "$tmp" "$bin"
+  trap - EXIT
+  echo "patched: $bin"
+fi
+
+# The shim must sit beside the binary: it is loaded via @executable_path, and a
+# rootless jailbreak's sandbox refuses to mmap a dylib out of some other trees.
+cp -f "$SHIM" "$dir/libnodeshim.dylib"
+ldid -S "$dir/libnodeshim.dylib"
+ldid "-S$ENTS" "$bin"
+echo "signed:  $bin"
+
+"$bin" -e 'console.log("node-ios: " + process.version + " " + process.platform + "/" + process.arch + " OK")'

@@ -1,0 +1,20 @@
+#!/var/jb/usr/bin/zsh
+set -e
+PREFIX=/var/jb
+LIB=$PREFIX/usr/local/lib/node-ios
+BIN=$PREFIX/usr/local/bin
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    # The distribution is fetched at install time, so dpkg does not know about
+    # it and would leave ~220MB behind.
+    rm -rf "$LIB/dist" "$LIB/dist.old"
+    for t in node npm npx corepack; do
+        # Only our own symlinks. A real file there belongs to something else.
+        if [ -L "$BIN/$t" ]; then
+            case "$(readlink "$BIN/$t")" in
+                "$LIB/dist/bin/$t") rm -f "$BIN/$t" ;;
+            esac
+        fi
+    done
+fi
+exit 0

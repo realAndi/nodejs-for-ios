@@ -1,0 +1,45 @@
+Package: com.andi.nodejs
+Name: Node.js
+Version: @VERSION@
+Architecture: iphoneos-arm64
+Maintainer: andi <tafilajandi@gmail.com>
+Author: OpenJS Foundation (upstream) / iOS port by andi
+Section: Development
+Priority: optional
+Depends: zsh, bash, python3, ldid, curl, tar, coreutils, firmware (>= 15.0)
+Conflicts: io.github.imcynic.nodejs
+Replaces: io.github.imcynic.nodejs
+Icon: https://raw.githubusercontent.com/@REPO@/main/assets/icon.png
+Depiction: https://@PAGES@/depiction.html
+Tag: role::developer
+Description: Node.js @NODE_VERSION@ with npm and working nvm, patched for iOS
+ A current Node.js on a jailbroken iPhone, with npm, npx and nvm.
+ .
+ Node is not cross-compiled here. The official darwin-arm64 build from
+ nodejs.org imports 725 symbols and iOS is missing exactly three of them, so
+ this package downloads Apple's own build, rewrites its Mach-O to claim
+ platform iOS, points the two framework load paths at the flat iOS layout, and
+ links in a small shim for what is left. The binary is verified against the
+ SHA-256 this package was built against before anything is patched.
+ .
+ The shim is what makes V8 run. iOS rejects MAP_JIT and kills a process that
+ executes a writable page, and pthread_jit_write_protect_np -- the call V8's
+ arm64 Darwin build uses to flip its code pages -- does not exist on iOS at
+ all. The shim strips MAP_JIT, remembers the region, and implements the flip
+ with mprotect. That flip is process-wide where the real API is per-thread, so
+ the shim also forces V8 --single-threaded, which is the one setting that
+ survives a `#!/usr/bin/env node` shebang and anything npm spawns.
+ .
+ It also remaps /bin/sh and friends into the bootstrap prefix, because a
+ rootless jailbreak has no /bin/sh and Node hard-codes it for `shell: true` --
+ without which execSync and every npm lifecycle script fail with ENOENT.
+ .
+ nvm works too. Source nodeios.sh from your shell profile: it corrects nvm's
+ architecture detection, which otherwise reads the device model out of
+ `uname -m` and asks nodejs.org for a darwin-iPhone16,1 build, and it patches
+ each version nvm installs. Node 24 and newer only; 23 and earlier use a Mach-O
+ bind format this port cannot rewrite.
+ .
+ Known limit: worker_threads is reliable up to two workers. Beyond that the
+ process-wide W^X flip races and the process takes SIGBUS. Run with
+ NODEIOS_V8_FLAGS=--jitless for worker-heavy work, which is slower but safe.

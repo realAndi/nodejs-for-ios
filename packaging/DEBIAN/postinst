@@ -1,0 +1,110 @@
+#!/var/jb/usr/bin/zsh
+# Fetch the official Node.js build and patch it for iOS.
+# Node is deliberately not shipped in this package; see control.
+set -e
+[ "$1" = "configure" ] || [ -z "$1" ] || exit 0
+
+PREFIX=/var/jb
+LIB=$PREFIX/usr/local/lib/node-ios
+BIN=$PREFIX/usr/local/bin
+# $BIN is on the front because npm and npx are `#!/usr/bin/env node`
+# scripts: without it the version check below cannot resolve `node`.
+PATH=$BIN:$PREFIX/usr/bin:$PREFIX/bin:/usr/bin:/bin:$PREFIX/usr/sbin:$PREFIX/sbin
+export PATH
+
+. "$LIB/version.env"
+
+say() { print -- "nodejs: $*"; }
+die() { print -u2 -- "nodejs: ERROR: $*"; exit 1; }
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+    else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# Everything below is invoked by name at some point. Sileo installs Depends
+# first, so a miss here means a hand-installed .deb or a package name wrong for
+# this bootstrap -- both worth failing on now, with the name, rather than
+# part-way through a 50MB download.
+missing=""
+for tool in curl tar python3 ldid df awk mktemp install; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
+    || missing="$missing sha256sum"
+[ -z "$missing" ] || die "missing required tool(s):$missing
+On a Procursus bootstrap: sudo apt install zsh coreutils curl tar python3 ldid"
+
+# ~50MB download, ~220MB unpacked, plus the patched copy while it is staged.
+avail=$(df -k "$LIB" | tail -1 | awk '{print $4}')
+[ "${avail:-0}" -gt 600000 ] || die "need ~600MB free under $LIB, have $((avail/1024))MB"
+
+# Stage inside $LIB rather than /tmp. The sandbox refuses to mmap() a dylib out
+# of some trees -- a binary staged under /var/mobile dies with "file system
+# sandbox blocked mmap()" before it reaches main -- and staging on the same
+# filesystem is what makes the final move atomic.
+WORK=$(mktemp -d "$LIB/.build.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT INT TERM
+
+say "downloading Node $NODE_VERSION (~50MB)"
+curl -fsSL --retry 3 --retry-delay 2 "$NODE_URL" -o "$WORK/node.tar.gz" \
+    || die "could not download $NODE_URL"
+
+got=$(sha256_of "$WORK/node.tar.gz")
+[ "$got" = "$NODE_TARBALL_SHA256" ] || die "tarball checksum mismatch
+  expected $NODE_TARBALL_SHA256
+  got      $got
+Refusing to patch a tarball that is not the one this package was built against."
+say "checksum verified"
+
+say "unpacking"
+tar xzf "$WORK/node.tar.gz" -C "$WORK" || die "could not unpack the tarball"
+rm -f "$WORK/node.tar.gz"
+SRC="$WORK/node-v$NODE_VERSION-darwin-arm64"
+[ -x "$SRC/bin/node" ] || die "no bin/node in the tarball"
+
+say "patching for iOS"
+# nodeios_patch.py refuses if this build links a dylib we have not vetted or
+# dropped a symbol the shim must repoint, rather than producing a broken binary.
+python3 "$LIB/nodeios_patch.py" "$SRC/bin/node" "$WORK/node.ios" \
+    || die "patching failed -- upstream build changed shape; not installing"
+mv -f "$WORK/node.ios" "$SRC/bin/node"
+chmod 755 "$SRC/bin/node"
+
+# The shim is loaded through @executable_path, so it has to sit beside the
+# binary. Sign the installed copy first and stage from it, so the smoke test
+# below exercises the same bytes that end up on disk.
+ldid -S "$LIB/libnodeshim.dylib" 2>/dev/null || true
+install -m 755 "$LIB/libnodeshim.dylib" "$SRC/bin/libnodeshim.dylib"
+ldid "-S$LIB/entitlements.plist" "$SRC/bin/node" || die "ldid signing failed"
+
+say "verifying"
+out=$("$SRC/bin/node" -e 'console.log(process.version + " " + process.platform + "/" + process.arch)' 2>&1) \
+    || die "patched binary did not run: $out"
+case "$out" in
+    v$NODE_VERSION*) say "verified: $out" ;;
+    *) die "unexpected version output: $out" ;;
+esac
+
+# Swap the whole distribution in one rename, so an interrupted install never
+# leaves a half-written tree behind the `node` symlink.
+rm -rf "$LIB/dist.old"
+[ -d "$LIB/dist" ] && mv "$LIB/dist" "$LIB/dist.old"
+mv "$SRC" "$LIB/dist"
+rm -rf "$LIB/dist.old"
+
+for t in node npm npx corepack; do
+    [ -e "$LIB/dist/bin/$t" ] && ln -sfn "$LIB/dist/bin/$t" "$BIN/$t"
+done
+
+# Final check against the installed layout, not the staging directory. Cheap,
+# and it is the only thing that proves what the user will actually run.
+out=$("$BIN/node" -e 'console.log(process.version)' 2>&1) \
+    || die "installed binary does not run: $out"
+
+say "installed Node $out with npm $("$BIN/npm" --version 2>/dev/null || echo '?')"
+say ""
+say "For nvm, add this to your shell profile:"
+say "  . $LIB/nodeios.sh"
+say "then: nvm install 24   (Node 24+ only -- older builds cannot be patched)"
+exit 0

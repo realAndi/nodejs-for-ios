@@ -1,0 +1,65 @@
+name: build and publish repo
+
+# Rebuilds the package for whatever nodejs.org currently lists as its newest
+# release and republishes the APT repo to GitHub Pages. There is no state to
+# track: the package version mirrors upstream, so Sileo only sees a new version
+# when Node actually ships one. Bump packaging/revision to force a rebuild
+# (e.g. after a shim change) without waiting for upstream.
+#
+# The orchestration lives in realAndi/ios-port-ci and is shared with the other
+# ports, so a change there -- a deprecated action, a new hardening step --
+# reaches all of them at once instead of being applied N times and forgotten in
+# the N+1th. This repository supplies only what is specific to Node: the three
+# scripts in tools/ and everything in packaging/. See that repo's CONTRACT.md.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Node version to build, e.g. 26.8.1 (blank = newest release)"
+        required: false
+  push:
+    branches: [main]
+    paths: ["packaging/**", "tools/**", ".github/workflows/publish.yml"]
+
+# The reusable workflow needs these, and a caller cannot grant more than it has.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  # A job that calls a reusable workflow is only `uses:`/`with:`/`secrets:` --
+  # no steps of its own -- so everything below is inputs.
+  publish:
+    uses: realAndi/ios-port-ci/.github/workflows/publish.yml@v1
+    with:
+      package: com.andi.nodejs
+      origin: nodejs-for-ios
+      label: Node.js for iOS
+      description: Node.js with npm and nvm, patched for jailbroken iOS
+      # tools/build-payload.sh compiles libnodeshim.dylib against Xcode's
+      # iPhoneOS SDK. That is the only step here that cannot run on Linux --
+      # fetching Node and assembling the .deb both happen in build-deb.sh.
+      needs-macos: true
+      # No Go anywhere in this port: the shim is C, built with
+      # `xcrun --sdk iphoneos clang`.
+      #
+      # iOS refuses to load an unsigned dylib ("mapped file has no cdhash") and
+      # the runners have no ldid.
+      brew-packages: ldid
+      # packaging/payload/ also holds shim.c and the Python patcher, which are
+      # committed source rather than build output. Narrowed to the one artifact
+      # the macOS job actually produces so the upload does not carry them twice.
+      payload-paths: |
+        packaging/payload/libnodeshim.dylib
+        packaging/payload/PAYLOAD.version
+      version: ${{ inputs.version || '' }}
+    secrets:
+      # Its own key, not the one that signs reallyitsandi.com and not gh-port's
+      # or CCForiOS's, so a compromise of this repository's CI cannot forge
+      # packages for the others.
+      GPG_KEY: ${{ secrets.NODEIOS_GPG_KEY }}
+      GPG_KEY_ID: ${{ secrets.NODEIOS_GPG_KEY_ID }}

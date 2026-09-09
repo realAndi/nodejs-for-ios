@@ -10,7 +10,8 @@ Depends: zsh, bash, python3, ldid, curl, tar, coreutils, firmware (>= 15.0)
 Conflicts: io.github.imcynic.nodejs
 Replaces: io.github.imcynic.nodejs
 Icon: https://raw.githubusercontent.com/@REPO@/main/assets/icon.png
-Depiction: https://@PAGES@/depiction.html
+Native-Depiction: https://@PAGES@/depiction.json
+SileoDepiction: https://@PAGES@/depiction.json
 Tag: role::developer
 Description: Node.js @NODE_VERSION@ with npm and working nvm, patched for iOS
  A current Node.js on a jailbroken iPhone, with npm, npx and nvm.

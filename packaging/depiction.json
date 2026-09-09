@@ -1,0 +1,164 @@
+{
+  "class": "DepictionTabView",
+  "minVersion": "0.1",
+  "tintColor": "#5FA04E",
+  "tabs": [
+    {
+      "class": "DepictionStackView",
+      "tabname": "Details",
+      "views": [
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "A real, current Node.js on your phone. `npm install`, `npx`, `node:sqlite`, WebAssembly, HTTPS and `nvm install` all work."
+        },
+        { "class": "DepictionSeparatorView" },
+        {
+          "class": "DepictionSubheaderView",
+          "title": "What gets installed",
+          "useBoldText": true,
+          "useBottomMargin": true
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "Not a cross-compile. The official `darwin-arm64` build from nodejs.org imports 725 symbols and iOS is missing exactly three of them, so this downloads Apple's own build and patches it: the Mach-O is restamped to claim platform iOS, the CoreFoundation and Security load paths are rewritten to the flat iOS layout, and a 68 KB shim is linked in for the rest.\n\nThe tarball is checked against the SHA-256 this package was built against before anything is patched, and the patcher refuses a build that links a dylib iOS lacks."
+        },
+        { "class": "DepictionSeparatorView" },
+        {
+          "class": "DepictionSubheaderView",
+          "title": "At a glance",
+          "useBoldText": true,
+          "useBottomMargin": true
+        },
+        { "class": "DepictionTableTextView", "title": "Package", "text": "com.andi.nodejs" },
+        { "class": "DepictionTableTextView", "title": "Downloads on install", "text": "about 50 MB" },
+        { "class": "DepictionTableTextView", "title": "Installed size", "text": "about 220 MB" },
+        { "class": "DepictionTableTextView", "title": "Tested on", "text": "iOS 17.3, Dopamine" },
+        {
+          "class": "DepictionTableButtonView",
+          "title": "Port source and write-up",
+          "action": "https://github.com/realAndi/nodejs-for-ios",
+          "openExternal": true
+        },
+        {
+          "class": "DepictionTableButtonView",
+          "title": "Node.js upstream",
+          "action": "https://nodejs.org",
+          "openExternal": true
+        },
+        { "class": "DepictionSeparatorView" },
+        {
+          "class": "DepictionSubheaderView",
+          "title": "How the JIT works",
+          "useBoldText": true,
+          "useBottomMargin": true
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "iOS rejects `MAP_JIT` with EINVAL and kills a process that executes a writable page, but it will let `mprotect` swing a page between read-write and read-execute. And `pthread_jit_write_protect_np`, the call V8's arm64 Darwin build uses to flip its code pages, does not exist on iOS at all.\n\nSo the shim strips `MAP_JIT`, remembers the region, and implements the flip with `mprotect`. That is process-wide where the real API is per-thread, so the shim also forces V8 `--single-threaded` from a library constructor — the one route that survives a `#!/usr/bin/env node` shebang and anything npm spawns."
+        }
+      ]
+    },
+    {
+      "class": "DepictionStackView",
+      "tabname": "Setup",
+      "views": [
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "Nothing to configure. `node`, `npm` and `npx` are on your PATH once the install finishes."
+        },
+        { "class": "DepictionSeparatorView" },
+        {
+          "class": "DepictionSubheaderView",
+          "title": "Using nvm",
+          "useBoldText": true,
+          "useBottomMargin": true
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "Install nvm as usual, then add one line to your shell profile:\n\n`. /var/jb/usr/local/lib/node-ios/nodeios.sh`\n\nIt fixes nvm's architecture detection and patches each version `nvm install` brings down. Without it, stock nvm reads the device model out of `uname -m`, asks nodejs.org for a `darwin-iPhone16,1` build, and falls back to a source compile that cannot work."
+        },
+        { "class": "DepictionSeparatorView" },
+        {
+          "class": "DepictionSubheaderView",
+          "title": "Native addons",
+          "useBoldText": true,
+          "useBottomMargin": true
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "A prebuilt `.node` from npm is a macOS dylib and will not load. Run `node-ios-patch` on it first."
+        }
+      ]
+    },
+    {
+      "class": "DepictionStackView",
+      "tabname": "Requires",
+      "views": [
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "- A rootless jailbreak (`/var/jb`). Tested on Dopamine.\n- iOS 15 or later, arm64. Tested on iOS 17.3, iPhone 15 Pro.\n- A network connection during install, for the 50 MB download.\n- About 220 MB once installed."
+        },
+        { "class": "DepictionSeparatorView" },
+        {
+          "class": "DepictionSubheaderView",
+          "title": "Dependencies",
+          "useBoldText": true,
+          "useBottomMargin": true
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "zsh, bash, python3, ldid, curl, tar, coreutils. Sileo installs any that are missing before this one.\n\nThis package replaces `io.github.imcynic.nodejs` if you have it."
+        }
+      ]
+    },
+    {
+      "class": "DepictionStackView",
+      "tabname": "Notes",
+      "views": [
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "**Node 24 and newer only.** Node 23 and earlier are built with a macOS deployment target of 11.0, so the linker emits classic `LC_DYLD_INFO_ONLY` bind opcodes rather than chained fixups, and this port has no opcode rewriter. `nvm install 22` will download and then fail to patch."
+        },
+        { "class": "DepictionSeparatorView" },
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "**`worker_threads` is reliable up to two workers.** Past that, the process-wide W^X flip races a worker isolate compiling against the main isolate executing, and the process takes SIGBUS.\n\nFor worker-heavy work run with `NODEIOS_V8_FLAGS=--jitless`, which is slower but thread-safe. Eight workers pass reliably that way."
+        },
+        { "class": "DepictionSeparatorView" },
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "**`/bin/sh` does not exist on a rootless jailbreak** and Node hard-codes it for `shell: true`. The shim remaps `/bin`, `/usr/bin` and friends into `/var/jb`, but only when the original really is missing."
+        },
+        { "class": "DepictionSeparatorView" },
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "**`--use-system-ca` is inert.** The macOS keychain API behind it does not exist on iOS, so the shim reports \"no trust settings\" and Node keeps its bundled Mozilla roots. Ordinary TLS is unaffected."
+        }
+      ]
+    }
+  ]
+}

@@ -33,6 +33,7 @@
           "useBoldText": true,
           "useBottomMargin": true
         },
+        { "class": "DepictionTableTextView", "title": "Version", "text": "@VERSION@" },
         { "class": "DepictionTableTextView", "title": "Package", "text": "com.andi.nodejs" },
         { "class": "DepictionTableTextView", "title": "Downloads on install", "text": "about 50 MB" },
         { "class": "DepictionTableTextView", "title": "Installed size", "text": "about 220 MB" },

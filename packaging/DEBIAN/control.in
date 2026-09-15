@@ -6,7 +6,7 @@ Maintainer: andi <tafilajandi@gmail.com>
 Author: OpenJS Foundation (upstream) / iOS port by andi
 Section: Development
 Priority: optional
-Depends: zsh, bash, python3, ldid, curl, tar, coreutils, firmware (>= 15.0)
+Depends: zsh, bash, python3, ldid, curl, tar, gzip, coreutils, firmware (>= 15.0)
 Conflicts: io.github.imcynic.nodejs
 Replaces: io.github.imcynic.nodejs
 Icon: https://raw.githubusercontent.com/@REPO@/main/assets/icon.png

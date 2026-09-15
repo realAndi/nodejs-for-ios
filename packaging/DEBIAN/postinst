@@ -27,13 +27,13 @@ sha256_of() {
 # this bootstrap -- both worth failing on now, with the name, rather than
 # part-way through a 50MB download.
 missing=""
-for tool in curl tar python3 ldid df awk mktemp install; do
+for tool in curl tar gzip python3 ldid df awk mktemp install; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
     || missing="$missing sha256sum"
 [ -z "$missing" ] || die "missing required tool(s):$missing
-On a Procursus bootstrap: sudo apt install zsh coreutils curl tar python3 ldid"
+On a Procursus bootstrap: sudo apt install zsh coreutils curl tar gzip python3 ldid"
 
 # ~50MB download, ~220MB unpacked, plus the patched copy while it is staged.
 avail=$(df -k "$LIB" | tail -1 | awk '{print $4}')

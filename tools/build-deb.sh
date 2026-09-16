@@ -36,6 +36,8 @@ GH_PAGES="${GH_PAGES:-}"
 command -v dpkg-deb >/dev/null || { echo "need dpkg-deb (apt install dpkg-dev)"; exit 1; }
 [ -f "$PAYLOAD/libnodeshim.dylib" ] || {
     echo "missing packaging/payload/libnodeshim.dylib -- run tools/build-payload.sh on macOS first"; exit 1; }
+[ -f "$PAYLOAD/node-ios-launcher" ] || {
+    echo "missing packaging/payload/node-ios-launcher -- run tools/build-payload.sh on macOS first"; exit 1; }
 [ -f "$PAYLOAD/PAYLOAD.version" ] || {
     echo "missing packaging/payload/PAYLOAD.version -- run tools/build-payload.sh on macOS first"; exit 1; }
 
@@ -76,11 +78,20 @@ echo "==> staging"
 STAGE="$TMP/stage"
 LIB="$STAGE/var/jb/usr/local/lib/node-ios"
 BIN="$STAGE/var/jb/usr/local/bin"
-mkdir -p "$STAGE/DEBIAN" "$LIB" "$BIN"
+PROFILE_D="$STAGE/var/jb/etc/profile.d"
+mkdir -p "$STAGE/DEBIAN" "$LIB" "$LIB/bin" "$BIN" "$PROFILE_D"
 
 install -m 755 "$PAYLOAD/libnodeshim.dylib"  "$LIB/libnodeshim.dylib"
 install -m 644 "$PAYLOAD/nodeios_patch.py"   "$LIB/nodeios_patch.py"
 install -m 644 "$PAYLOAD/shim.c"             "$LIB/shim.c"
+install -m 644 "$PAYLOAD/launcher.c"         "$LIB/launcher.c"
+# One copy per command: the launcher picks the script by its own file name.
+# The postinst links $BIN/<name> to these once Node is in place.
+for t in npm npx corepack; do
+    install -m 755 "$PAYLOAD/node-ios-launcher" "$LIB/bin/$t"
+done
+# Puts ~/.npm-global/bin, where `npm install -g` now installs, on PATH.
+install -m 644 "$PAYLOAD/profile.sh"         "$PROFILE_D/node-ios.sh"
 install -m 644 "$PAYLOAD/entitlements.plist" "$LIB/entitlements.plist"
 install -m 644 "$PAYLOAD/nodeios.sh"         "$LIB/nodeios.sh"
 install -m 755 "$PAYLOAD/node-ios-patch"     "$BIN/node-ios-patch"
@@ -139,12 +150,12 @@ echo "==> $DEB ($(du -h "$DEB" | cut -f1))"
 # Compared by content, not .deb bytes: an archive carries timestamps and member
 # ordering that differ between builds of identical input.
 #
-# libnodeshim.dylib is excluded because a compiled, ldid-signed binary is never
-# byte-identical across build hosts. Its source, shim.c, ships in the package
-# and IS compared, so a real change to the shim is still caught. Excluded by
-# path rather than by name: `! -name libnodeshim.dylib` would also drop any
-# other file that came to share the basename, which is exactly how a sibling
-# port lost sight of a second file called `gh`.
+# libnodeshim.dylib and the launcher copies are excluded because a compiled,
+# ldid-signed binary is never byte-identical across build hosts. Their sources,
+# shim.c and launcher.c, ship in the package and ARE compared, so a real change
+# to either is still caught. Excluded by path rather than by name: `! -name npm`
+# would also drop any other file that came to share the basename, which is
+# exactly how a sibling port lost sight of a second file called `gh`.
 #
 # version.env is compared and deliberately so -- it records only the upstream
 # version, tarball name and published checksum, all of which are fixed for a
@@ -158,7 +169,10 @@ payload_digest() {
       && tar xf control.tar.* -C x 2>/dev/null )
     ( cd "$dir/x" && find . -type f \
         ! -path './control' ! -path './md5sums' \
-        ! -path './var/jb/usr/local/lib/node-ios/libnodeshim.dylib' -print0 | sort -z \
+        ! -path './var/jb/usr/local/lib/node-ios/libnodeshim.dylib' \
+        ! -path './var/jb/usr/local/lib/node-ios/bin/npm' \
+        ! -path './var/jb/usr/local/lib/node-ios/bin/npx' \
+        ! -path './var/jb/usr/local/lib/node-ios/bin/corepack' -print0 | sort -z \
       | xargs -0 shasum -a 256 2>/dev/null ) | shasum -a 256 | cut -d' ' -f1
     rm -rf "$dir"
 }

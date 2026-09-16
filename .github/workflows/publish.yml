@@ -40,8 +40,8 @@ jobs:
       origin: nodejs-for-ios
       label: Node.js for iOS
       description: Node.js with npm and nvm, patched for jailbroken iOS
-      # tools/build-payload.sh compiles libnodeshim.dylib against Xcode's
-      # iPhoneOS SDK. That is the only step here that cannot run on Linux --
+      # tools/build-payload.sh compiles libnodeshim.dylib and node-ios-launcher
+      # against Xcode's iPhoneOS SDK. That is the only step here that cannot run on Linux --
       # fetching Node and assembling the .deb both happen in build-deb.sh.
       needs-macos: true
       # No Go anywhere in this port: the shim is C, built with
@@ -51,10 +51,13 @@ jobs:
       # the runners have no ldid.
       brew-packages: ldid
       # packaging/payload/ also holds shim.c and the Python patcher, which are
-      # committed source rather than build output. Narrowed to the one artifact
+      # committed source rather than build output. Narrowed to the artifacts
       # the macOS job actually produces so the upload does not carry them twice.
+      # A compiled file missing from this list never reaches build-deb.sh, which
+      # then refuses to build.
       payload-paths: |
         packaging/payload/libnodeshim.dylib
+        packaging/payload/node-ios-launcher
         packaging/payload/PAYLOAD.version
       version: ${{ inputs.version || '' }}
     secrets:

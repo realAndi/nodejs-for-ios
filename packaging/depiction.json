@@ -73,7 +73,20 @@
           "class": "DepictionMarkdownView",
           "useSpacing": true,
           "useRawFormat": false,
-          "markdown": "Nothing to configure. `node`, `npm` and `npx` are on your PATH once the install finishes."
+          "markdown": "Nothing to configure. `node`, `npm` and `npx` are on your PATH once the install finishes, and other programs can run them too, so `pi install npm:...` works."
+        },
+        { "class": "DepictionSeparatorView" },
+        {
+          "class": "DepictionSubheaderView",
+          "title": "Global packages",
+          "useBoldText": true,
+          "useBottomMargin": true
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "`npm install -g` installs into `~/.npm-global`, for your user only and without sudo. Open a new shell after installing so its bin directory is on your PATH.\n\nGlobal packages now survive package upgrades. Anything installed globally before this version was lost on upgrade and needs installing again."
         },
         { "class": "DepictionSeparatorView" },
         {
@@ -99,7 +112,7 @@
           "class": "DepictionMarkdownView",
           "useSpacing": true,
           "useRawFormat": false,
-          "markdown": "A prebuilt `.node` from npm is a macOS dylib and will not load. Run `node-ios-patch` on it first."
+          "markdown": "A prebuilt `.node` from npm is a macOS build and does not load yet. `node-ios-patch` only patches Node itself and cannot convert one."
         }
       ]
     },
@@ -151,6 +164,13 @@
           "useSpacing": true,
           "useRawFormat": false,
           "markdown": "**`/bin/sh` does not exist on a rootless jailbreak** and Node hard-codes it for `shell: true`. The shim remaps `/bin`, `/usr/bin` and friends into `/var/jb`, but only when the original really is missing."
+        },
+        { "class": "DepictionSeparatorView" },
+        {
+          "class": "DepictionMarkdownView",
+          "useSpacing": true,
+          "useRawFormat": false,
+          "markdown": "**Only bootstrap binaries can run a `#!` script here.** Node and other runtimes get EPERM, or ENOENT for `#!/usr/bin/env`. So `npm` and `npx` are small signed launchers, and the shim runs the interpreter itself when Node spawns any other script."
         },
         { "class": "DepictionSeparatorView" },
         {

@@ -86,10 +86,36 @@ line, a `#!/usr/bin/env node` shebang, and anything npm spawns through
   before it reaches `main`, and a binary under `/var/jb/tmp` is SIGKILLed with
   no crash report at all. The postinst stages inside its own install directory
   for both reasons, and because same-filesystem makes the final move atomic.
+- **Nothing but a bootstrap binary can run a `#!` script.** zsh, bash and
+  python3 exec one fine, because the jailbreak handles the `#!` line for them.
+  Node and Pi's Bun runtime get EPERM, or ENOENT for `#!/usr/bin/env`, which
+  exists only under `/var/jb`. `npm` and `npx` are exactly such scripts, so
+  typing `npm` worked while `spawn("npm")` from Node and `pi install npm:...`
+  both failed. The package therefore links `npm`, `npx` and `corepack` to a
+  tiny signed Mach-O launcher (`launcher.c`) that execs node with the script.
+  The shim covers everything else: when a spawn or exec fails that way on an
+  executable `#!` script, it runs the interpreter itself, so Node can spawn the
+  commands `npm install -g` creates as well.
 - **`uname -m` answers the device model** (`iPhone16,1`), not the architecture,
   and there is no `sysctl(8)`. Stock nvm therefore builds a
   `darwin-iPhone16,1` download URL, 404s, and falls back to a source compile
   that cannot work. `nodeios.sh` overrides `nvm_get_arch`.
+
+## Global packages
+
+`npm install -g` installs into `~/.npm-global`, per user and without sudo.
+The package sets that as npm's builtin config and adds
+`/var/jb/etc/profile.d/node-ios.sh`, which puts `~/.npm-global/bin` on PATH in
+login shells. Open a new shell after installing the package.
+
+Two consequences of the layout, both deliberate:
+
+- Global packages survive package upgrades. Before revision 4 they were written
+  into Node's own distribution directory, off PATH, and each upgrade deleted
+  them. Anything installed that way needs installing again.
+- `~/.npm-global/bin` is appended to PATH, not prepended, so
+  `npm install -g npm` does not replace the packaged npm. Its npm is a `#!`
+  script that Node and Pi could not spawn.
 
 ## Using nvm
 
@@ -117,8 +143,10 @@ that anything `nvm install` brings down is patched and signed before you use it.
   mapping thread, and restricting the flip turns the crash into a write fault
   instead. `NODEIOS_V8_FLAGS=--jitless` is thread-safe and handles eight workers
   reliably, at interpreter speed and without WebAssembly.
-- **Native addons need patching.** A prebuilt `.node` from npm is a macOS
-  dylib; run `node-ios-patch` on it.
+- **Prebuilt native addons do not load.** A `.node` from npm is a macOS
+  build, and dyld refuses it as the wrong platform. `node-ios-patch` cannot
+  convert one yet: it patches node itself, and refuses a file without V8's JIT
+  imports.
 
 ## What was measured on device
 
@@ -142,7 +170,7 @@ Three scripts, per the [ios-port-ci contract](https://github.com/realAndi/ios-po
 | path | runs on | does |
 |---|---|---|
 | `tools/resolve-version.sh` | Linux | echoes the Node version to build, refusing anything below 24 |
-| `tools/build-payload.sh` | macOS | compiles and signs `libnodeshim.dylib` against the iPhoneOS SDK |
+| `tools/build-payload.sh` | macOS | compiles and signs `libnodeshim.dylib` and the npm launcher against the iPhoneOS SDK |
 | `tools/build-deb.sh` | Linux | fetches Node, verifies its checksum, proves it is patchable, assembles the `.deb` |
 
 Node is not in the package. It is ~145 MB per version and the published

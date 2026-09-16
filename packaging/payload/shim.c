@@ -32,11 +32,19 @@
  *     system path under the prefix when, and only when, the original is
  *     missing and the prefixed one exists. Set NODEIOS_JB_PREFIX to override
  *     the default /var/jb.
+ *
+ *  5. #! scripts. This binary cannot exec one on a rootless jailbreak -- the
+ *     kernel answers EPERM, or ENOENT for `#!/usr/bin/env` -- and every command
+ *     npm installs is one. When a spawn or exec fails that way and the target
+ *     is an executable #! script, the same four functions run its interpreter
+ *     themselves, the way the kernel would have.
  */
 
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
+#include <crt_externs.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <dlfcn.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -235,15 +243,187 @@ typedef int (*posix_spawn_fn)(pid_t *, const char *,
 typedef int (*execve_fn)(const char *, char *const [], char *const []);
 typedef int (*execvp_fn)(const char *, char *const []);
 
+int posix_spawn(pid_t *, const char *, const posix_spawn_file_actions_t *,
+                const posix_spawnattr_t *, char *const [], char *const []);
+int execve(const char *, char *const [], char *const []);
+
+static posix_spawn_fn real_posix_spawn(void) {
+    static posix_spawn_fn real = NULL;
+    if (real == NULL) real = (posix_spawn_fn)real_sym("posix_spawn", (void *)posix_spawn);
+    return real;
+}
+
+static execve_fn real_execve(void) {
+    static execve_fn real = NULL;
+    if (real == NULL) real = (execve_fn)real_sym("execve", (void *)execve);
+    return real;
+}
+
+/* ---- 5. #! scripts ----------------------------------------------------- */
+
+/* Measured on iOS 17.3 / Dopamine, node spawning an executable script:
+
+     #!/var/jb/usr/bin/env node    EPERM
+     #!/var/jb/usr/bin/zsh         EPERM
+     #!/usr/bin/env node           ENOENT   (no /usr/bin/env outside /var/jb)
+
+   The same scripts run when zsh or python3 spawns them -- the jailbreak does
+   the #! handling for its own bootstrap binaries in userland -- and a signed
+   Mach-O runs from anywhere. npm itself, and every command `npm install -g`
+   creates, is such a script, so without this a node program could spawn none
+   of them by name.
+
+   So when a spawn or exec fails with one of those errors and the target is an
+   executable #! script, do what the kernel would have: exec the interpreter
+   with the optional argument, the script's path, and the original arguments
+   after argv[0]. The interpreter goes through remap_exec, which is what turns
+   /usr/bin/env into /var/jb/usr/bin/env. Only after a failure, only for a
+   regular file with an execute bit that really starts with #!, and only one
+   level deep -- nothing that works today takes a different path.
+
+   Everything here may run in a forked child between fork and exec (libuv's
+   fallback when posix_spawn cannot express the request), so it sticks to
+   stack buffers and open/read/stat/access, with no allocation. */
+
+#define SHEBANG_MAX      512      /* XNU's own limit for a #! line */
+#define SHEBANG_MAX_ARGS 65536    /* bounds the argv array on the stack */
+
+typedef struct {
+    char        interp[SHEBANG_MAX];    /* as written in the script */
+    char        arg[SHEBANG_MAX];       /* "" when there is none */
+    char        remapped[1024];
+    const char *exec_path;              /* interp, or its /var/jb stand-in */
+} shebang_t;
+
+static int shebang_errno(int err) {
+    return err == EPERM || err == ENOENT || err == ENOEXEC;
+}
+
+static int read_shebang(const char *path, shebang_t *sb) {
+    struct stat st;
+    if (path == NULL || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
+    if (access(path, X_OK) != 0) return 0;
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char line[SHEBANG_MAX + 1];
+    ssize_t n = read(fd, line, SHEBANG_MAX);
+    close(fd);
+    if (n < 3 || line[0] != '#' || line[1] != '!') return 0;
+
+    char *end = memchr(line, '\n', (size_t)n);
+    if (end == NULL) return 0;              /* over-long: the kernel refuses too */
+    while (end > line + 2 && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r'))
+        end--;
+    *end = '\0';
+
+    char *p = line + 2;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '/') return 0;                /* relative or missing interpreter */
+    char *q = p;
+    while (*q != '\0' && *q != ' ' && *q != '\t') q++;
+    memcpy(sb->interp, p, (size_t)(q - p));
+    sb->interp[q - p] = '\0';
+
+    while (*q == ' ' || *q == '\t') q++;    /* the rest of the line is one argument */
+    memcpy(sb->arg, q, strlen(q) + 1);
+
+    const char *r = remap_exec(sb->interp, sb->remapped, sizeof sb->remapped);
+    sb->exec_path = r ? r : sb->interp;
+    return 1;
+}
+
+static size_t arg_count(char *const argv[]) {
+    size_t n = 0;
+    if (argv) while (argv[n]) n++;
+    return n;
+}
+
+/* interp [arg] script argv[1..]; `out` must hold arg_count(argv) + 4 slots. */
+static void shebang_argv(const shebang_t *sb, const char *script,
+                         char *const argv[], size_t n, char **out) {
+    size_t i = 0;
+    out[i++] = (char *)sb->interp;
+    if (sb->arg[0] != '\0') out[i++] = (char *)sb->arg;
+    out[i++] = (char *)script;
+    for (size_t k = 1; k < n; k++) out[i++] = argv[k];
+    out[i] = NULL;
+}
+
+/* First executable regular file named `file` on $PATH, as execvp and
+   posix_spawnp would pick it. NULL when there is none or it does not fit. */
+static const char *search_path(const char *file, char *buf, size_t buflen) {
+    const char *path = getenv("PATH");
+    if (path == NULL) path = "/usr/bin:/bin";
+    size_t flen = strlen(file);
+    for (const char *p = path;; ) {
+        const char *z = strchr(p, ':');
+        size_t dlen = z ? (size_t)(z - p) : strlen(p);
+        if (dlen == 0) {
+            if (flen + 1 <= buflen) memcpy(buf, file, flen + 1);   /* empty entry: cwd */
+            else goto next;
+        } else if (dlen + 1 + flen + 1 <= buflen) {
+            memcpy(buf, p, dlen);
+            buf[dlen] = '/';
+            memcpy(buf + dlen + 1, file, flen + 1);
+        } else {
+            goto next;
+        }
+        {
+            struct stat st;
+            if (stat(buf, &st) == 0 && S_ISREG(st.st_mode) && access(buf, X_OK) == 0)
+                return buf;
+        }
+    next:
+        if (z == NULL) return NULL;
+        p = z + 1;
+    }
+}
+
+/* posix_spawn(p) failed with `err`; retry through the script's interpreter.
+   Returns `err` untouched when the target is not a script we can run. */
+static int spawn_script(pid_t *pid, const char *script,
+                        const posix_spawn_file_actions_t *acts,
+                        const posix_spawnattr_t *attr,
+                        char *const argv[], char *const envp[], int err) {
+    shebang_t sb;
+    if (!shebang_errno(err) || !read_shebang(script, &sb)) return err;
+    size_t n = arg_count(argv);
+    if (n > SHEBANG_MAX_ARGS) return err;
+    char *args[n + 4];
+    shebang_argv(&sb, script, argv, n, args);
+    if (debug_on())
+        fprintf(stderr, "[node-ios] #! %s -> %s\n", script, sb.exec_path);
+    return real_posix_spawn()(pid, sb.exec_path, acts, attr, args, envp);
+}
+
+/* execve/execvp failed with `err`; retry through the interpreter. Returns
+   only on failure, with the errno to report. */
+static int exec_script(const char *script, char *const argv[], char *const envp[], int err) {
+    shebang_t sb;
+    if (!shebang_errno(err) || !read_shebang(script, &sb)) return err;
+    size_t n = arg_count(argv);
+    if (n > SHEBANG_MAX_ARGS) return err;
+    char *args[n + 4];
+    shebang_argv(&sb, script, argv, n, args);
+    if (debug_on())
+        fprintf(stderr, "[node-ios] #! %s -> %s\n", script, sb.exec_path);
+    real_execve()(sb.exec_path, args, envp);
+    return errno;
+}
+
+/* ---- 4 and 5: the interposed calls ------------------------------------- */
+
 int posix_spawn(pid_t *pid, const char *path,
                 const posix_spawn_file_actions_t *acts,
                 const posix_spawnattr_t *attr,
                 char *const argv[], char *const envp[]) {
-    static posix_spawn_fn real = NULL;
-    if (real == NULL) real = (posix_spawn_fn)real_sym("posix_spawn", (void *)posix_spawn);
     char buf[1024];
     const char *p = remap_exec(path, buf, sizeof buf);
-    return real(pid, p ? p : path, acts, attr, argv, envp);
+    const char *target = p ? p : path;
+    int err = real_posix_spawn()(pid, target, acts, attr, argv, envp);
+    if (err == 0) return 0;
+    return spawn_script(pid, target, acts, attr, argv, envp, err);
 }
 
 int posix_spawnp(pid_t *pid, const char *file,
@@ -254,15 +434,24 @@ int posix_spawnp(pid_t *pid, const char *file,
     if (real == NULL) real = (posix_spawn_fn)real_sym("posix_spawnp", (void *)posix_spawnp);
     char buf[1024];
     const char *p = remap_exec(file, buf, sizeof buf);
-    return real(pid, p ? p : file, acts, attr, argv, envp);
+    const char *target = p ? p : file;
+    int err = real(pid, target, acts, attr, argv, envp);
+    if (err == 0 || target == NULL || !shebang_errno(err)) return err;
+
+    char found[1024];
+    const char *script = strchr(target, '/') ? target
+                                             : search_path(target, found, sizeof found);
+    if (script == NULL) return err;
+    return spawn_script(pid, script, acts, attr, argv, envp, err);
 }
 
 int execve(const char *path, char *const argv[], char *const envp[]) {
-    static execve_fn real = NULL;
-    if (real == NULL) real = (execve_fn)real_sym("execve", (void *)execve);
     char buf[1024];
     const char *p = remap_exec(path, buf, sizeof buf);
-    return real(p ? p : path, argv, envp);
+    const char *target = p ? p : path;
+    real_execve()(target, argv, envp);
+    errno = exec_script(target, argv, envp, errno);
+    return -1;
 }
 
 int execvp(const char *file, char *const argv[]) {
@@ -270,10 +459,20 @@ int execvp(const char *file, char *const argv[]) {
     if (real == NULL) real = (execvp_fn)real_sym("execvp", (void *)execvp);
     char buf[1024];
     const char *p = remap_exec(file, buf, sizeof buf);
-    return real(p ? p : file, argv);
+    const char *target = p ? p : file;
+    real(target, argv);
+    int err = errno;
+    if (target == NULL || !shebang_errno(err)) return -1;
+
+    char found[1024];
+    const char *script = strchr(target, '/') ? target
+                                             : search_path(target, found, sizeof found);
+    if (script != NULL) err = exec_script(script, argv, *_NSGetEnviron(), err);
+    errno = err;
+    return -1;
 }
 
-/* ---- 5. force the V8 flags the W^X emulation requires ------------------ */
+/* ---- 6. force the V8 flags the W^X emulation requires ------------------ */
 
 /* The flip above is process-wide where the real pthread_jit_write_protect_np is
    per-thread, so a background compiler thread can swing the pool to RW while

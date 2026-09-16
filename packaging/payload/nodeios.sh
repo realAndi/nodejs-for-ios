@@ -29,8 +29,10 @@ if command -v nvm >/dev/null 2>&1; then
     case "$1" in
       install|i)
         if [ $rc -eq 0 ]; then
+          # stdout only: a patch that fails has to say so, or `nvm use` hands
+          # people a macOS binary that dies in dyld with no hint why.
           command -v node-ios-patch >/dev/null 2>&1 \
-            && node-ios-patch --all >/dev/null 2>&1
+            && node-ios-patch --all >/dev/null
         fi
         ;;
     esac

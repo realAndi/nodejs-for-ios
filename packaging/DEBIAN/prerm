@@ -10,9 +10,11 @@ if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
     rm -rf "$LIB/dist" "$LIB/dist.old"
     for t in node npm npx corepack; do
         # Only our own symlinks. A real file there belongs to something else.
+        # $LIB/bin is where npm, npx and corepack point now; $LIB/dist/bin is
+        # where every revision before the launchers pointed them.
         if [ -L "$BIN/$t" ]; then
             case "$(readlink "$BIN/$t")" in
-                "$LIB/dist/bin/$t") rm -f "$BIN/$t" ;;
+                "$LIB/dist/bin/$t"|"$LIB/bin/$t") rm -f "$BIN/$t" ;;
             esac
         fi
     done

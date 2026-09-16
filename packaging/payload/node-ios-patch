@@ -10,7 +10,10 @@
 set -euo pipefail
 
 PREFIX="${NODEIOS_PREFIX:-/var/jb}"
-TOOLS="${NODEIOS_TOOLS:-$PREFIX/usr/libexec/node-ios}"
+# Where the package installs the patcher, shim and entitlements. This used to
+# say usr/libexec/node-ios, where nothing is installed, so the command failed on
+# every device and the nvm wrapper hid it.
+TOOLS="${NODEIOS_TOOLS:-$PREFIX/usr/local/lib/node-ios}"
 PATCHER="$TOOLS/nodeios_patch.py"
 SHIM="$TOOLS/libnodeshim.dylib"
 ENTS="$TOOLS/entitlements.plist"

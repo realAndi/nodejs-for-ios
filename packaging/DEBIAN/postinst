@@ -77,6 +77,25 @@ chmod 755 "$SRC/bin/node"
 ldid -S "$LIB/libnodeshim.dylib" 2>/dev/null || true
 install -m 755 "$LIB/libnodeshim.dylib" "$SRC/bin/libnodeshim.dylib"
 ldid "-S$LIB/entitlements.plist" "$SRC/bin/node" || die "ldid signing failed"
+for t in npm npx corepack; do
+    ldid -S "$LIB/bin/$t" 2>/dev/null || true
+done
+
+# Global packages go to each user's ~/.npm-global instead of into this
+# distribution. Left at npm's default, `npm install -g` wrote into $LIB/dist:
+# its commands were not on PATH, and the next upgrade -- which swaps dist out
+# wholesale below -- deleted them. The shared $BIN is root's, so a per-user
+# prefix is also what lets mobile install without sudo. profile.d/node-ios.sh
+# puts its bin on PATH.
+#
+# Written as npm's builtin config, the npmrc inside npm's own package, which is
+# where Homebrew's node sets its prefix too. It belongs to this npm alone: nvm
+# refuses to run while ~/.npmrc sets a prefix, and never looks at this file.
+# npm expands `~/` with os.homedir(), which falls back to the passwd entry when
+# HOME is unset.
+[ -d "$SRC/lib/node_modules/npm" ] || die "no npm in the tarball"
+print -r -- 'prefix = ~/.npm-global' > "$SRC/lib/node_modules/npm/npmrc"
+chmod 644 "$SRC/lib/node_modules/npm/npmrc"
 
 say "verifying"
 out=$("$SRC/bin/node" -e 'console.log(process.version + " " + process.platform + "/" + process.arch)' 2>&1) \
@@ -93,16 +112,33 @@ rm -rf "$LIB/dist.old"
 mv "$SRC" "$LIB/dist"
 rm -rf "$LIB/dist.old"
 
-for t in node npm npx corepack; do
-    [ -e "$LIB/dist/bin/$t" ] && ln -sfn "$LIB/dist/bin/$t" "$BIN/$t"
+# node is a Mach-O and is linked directly. npm, npx and corepack are
+# `#!/usr/bin/env node` scripts in Node's layout, which only a bootstrap binary
+# can exec here -- node and Pi's runtime get EPERM or ENOENT, so `pi install`
+# and anything else that spawns npm failed -- and are linked to the signed
+# launchers in $LIB/bin instead. See launcher.c.
+ln -sfn "$LIB/dist/bin/node" "$BIN/node"
+for t in npm npx corepack; do
+    if [ -e "$LIB/dist/bin/$t" ]; then
+        ln -sfn "$LIB/bin/$t" "$BIN/$t"
+    elif [ -L "$BIN/$t" ]; then
+        # corepack left Node's distribution in 25. Drop our own link to a
+        # command this Node does not have, but nothing that is not ours.
+        case "$(readlink "$BIN/$t")" in
+            "$LIB/"*) rm -f "$BIN/$t" ;;
+        esac
+    fi
 done
 
 # Final check against the installed layout, not the staging directory. Cheap,
 # and it is the only thing that proves what the user will actually run.
 out=$("$BIN/node" -e 'console.log(process.version)' 2>&1) \
     || die "installed binary does not run: $out"
+npm_version=$("$BIN/npm" --version 2>&1) \
+    || die "npm does not run through its launcher: $npm_version"
 
-say "installed Node $out with npm $("$BIN/npm" --version 2>/dev/null || echo '?')"
+say "installed Node $out with npm $npm_version"
+say "global packages (npm install -g) go to ~/.npm-global; its bin is on PATH in new login shells"
 say ""
 say "For nvm, add this to your shell profile:"
 say "  . $LIB/nodeios.sh"

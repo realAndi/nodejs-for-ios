@@ -3,8 +3,9 @@
 #
 #   tools/build-payload.sh <version>
 #
-# macOS only: libnodeshim.dylib is compiled against Xcode's iPhoneOS SDK, which
-# is the one thing in this port that cannot be done on Linux. Everything else --
+# macOS only: libnodeshim.dylib and node-ios-launcher are compiled against
+# Xcode's iPhoneOS SDK, which is the one thing in this port that cannot be done
+# on Linux. Everything else --
 # fetching Node, checking it is patchable, assembling the .deb -- is Linux work
 # and lives in build-deb.sh.
 #
@@ -46,25 +47,40 @@ xcrun --sdk iphoneos clang \
 
 ldid -S "$PAYLOAD/libnodeshim.dylib"
 
+# npm, npx and corepack are `#!/usr/bin/env node` scripts, and on a rootless
+# jailbreak only a bootstrap binary can exec one -- node itself and Pi's runtime
+# get EPERM or ENOENT. The package points those commands at copies of this
+# instead, a signed Mach-O that execs node with the script. See launcher.c.
+echo "==> compiling node-ios-launcher for iphoneos-arm64"
+xcrun --sdk iphoneos clang \
+    -arch arm64 -miphoneos-version-min=15.0 \
+    -O2 -Wall -Wextra \
+    -o "$PAYLOAD/node-ios-launcher" "$PAYLOAD/launcher.c"
+
+ldid -S "$PAYLOAD/node-ios-launcher"
+
 # build-shim's sibling port shipped an unsigned dylib once because ldid was
 # missing and the build only warned. Assert it here, as a hard failure: an
-# unsigned shim produces a package that cannot possibly work, and finding that
-# out on a device is far more expensive than finding it out now.
+# unsigned shim or launcher produces a package that cannot possibly work, and
+# finding that out on a device is far more expensive than finding it out now.
 if command -v codesign >/dev/null 2>&1; then
-    # Captured, not piped into `grep -q`: grep exits at the first match and
-    # closes the pipe, codesign takes SIGPIPE, and `set -o pipefail` then fails
-    # the check that just succeeded. codesign also prints "no signature" for an
-    # ldid ad-hoc signature -- it has no CMS blob -- so CodeDirectory is the
-    # thing to look for.
-    sig="$(codesign -dv "$PAYLOAD/libnodeshim.dylib" 2>&1 || true)"
-    case "$sig" in
-        *CodeDirectory*) ;;
-        *) echo "shim is not signed -- iOS would refuse to load it" >&2; exit 1 ;;
-    esac
+    for f in libnodeshim.dylib node-ios-launcher; do
+        # Captured, not piped into `grep -q`: grep exits at the first match and
+        # closes the pipe, codesign takes SIGPIPE, and `set -o pipefail` then
+        # fails the check that just succeeded. codesign also prints "no
+        # signature" for an ldid ad-hoc signature -- it has no CMS blob -- so
+        # CodeDirectory is the thing to look for.
+        sig="$(codesign -dv "$PAYLOAD/$f" 2>&1 || true)"
+        case "$sig" in
+            *CodeDirectory*) ;;
+            *) echo "$f is not signed -- iOS would refuse to load it" >&2; exit 1 ;;
+        esac
+    done
 fi
 
-echo "==> checking the shim really is an iOS Mach-O"
+echo "==> checking the shim and launcher really are iOS Mach-Os"
 python3 "$CI_TOOLS/check-macho.py" "$PAYLOAD/libnodeshim.dylib"
+python3 "$CI_TOOLS/check-macho.py" "$PAYLOAD/node-ios-launcher"
 
 # Every symbol the shim exports must be one the patcher knows how to repoint,
 # and vice versa for the required ones. A shim that stopped exporting

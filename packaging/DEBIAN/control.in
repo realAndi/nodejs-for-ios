@@ -35,6 +35,13 @@ Description: Node.js @NODE_VERSION@ with npm and working nvm, patched for iOS
  rootless jailbreak has no /bin/sh and Node hard-codes it for `shell: true` --
  without which execSync and every npm lifecycle script fail with ENOENT.
  .
+ npm, npx and anything npm installs work from other programs too, not just
+ from a shell. On a rootless jailbreak only bootstrap binaries can exec a #!
+ script, so npm and npx are signed Mach-O launchers here, and the shim runs
+ other #! scripts itself when Node spawns them. That is what lets
+ `pi install npm:...` work. `npm install -g` goes to ~/.npm-global, per user,
+ without sudo, and survives upgrades.
+ .
  nvm works too. Source nodeios.sh from your shell profile: it corrects nvm's
  architecture detection, which otherwise reads the device model out of
  `uname -m` and asks nodejs.org for a darwin-iPhone16,1 build, and it patches

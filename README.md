@@ -57,21 +57,60 @@ Established by running a probe on the device rather than assuming:
 | `mmap` with `MAP_JIT` | `EINVAL` |
 | `mmap` RW → write → `mprotect` RX → execute | **works** |
 
-`pthread_jit_write_protect_np` is absent, so V8's arm64 Darwin build cannot flip
-its code pages the way it expects. The shim therefore interposes `mmap`, strips
-`MAP_JIT`, remembers the region, and implements the flip as an `mprotect` over
-the regions it is tracking.
+`pthread_jit_write_protect_np` is absent, and it is per thread: the thread
+writing code sees its pages read-write while every other thread keeps executing
+them. iOS can only change protection for the whole process. So the shim tracks
+every 16 KB page of V8's code ranges as RW or RX and lets faults move them:
 
-That flip is **process-wide** where the real API is per-thread. A background
-compiler thread swinging the code pool to read-write while the main thread is
-executing out of it is an instant SIGBUS, so V8 has to run `--single-threaded`.
+| event | what the shim does |
+|---|---|
+| `mmap` with `MAP_JIT` | strips the flag and records the range |
+| `mprotect` or `munmap` on a code range | passes it on and updates the record; RWX is granted as RW |
+| `pthread_jit_write_protect_np(0)` | marks this thread as writing; changes no protection |
+| write fault by a writing thread | makes that one page RW and counts the thread as its writer |
+| execute fault | waits until no thread is still writing the page, makes it RX |
+| `pthread_jit_write_protect_np(1)` | drops this thread's writer counts |
 
-`--single-threaded` is rejected in `NODE_OPTIONS`, which rules out the obvious
-way to reach child processes. Node exports `v8::V8::SetFlagsFromString`, though,
-so the shim sets the flag from a library constructor — before `main`, long
-before `V8::Initialize`. That covers every route into the binary: the command
-line, a `#!/usr/bin/env node` shebang, and anything npm spawns through
-`process.execPath`. `NODEIOS_V8_FLAGS` overrides it; the empty string opts out.
+After a repair the faulting instruction runs again. The faults arrive as
+SIGBUS or SIGSEGV, which V8's WebAssembly trap handler and Node also claim, so
+the shim installs its handler before `main` and interposes `sigaction` and
+`signal` for those two signals. Their handlers are recorded and chained to for
+every fault that is not a code-page repair, and a crash signal still ends the
+process with the same status.
+
+The first version of the shim `mprotect`ed every code range on every call
+instead. That was process-wide, so a worker isolate compiling pulled the main
+isolate's code out from under it. Measured on an iPhone 15 Pro, iOS 17.3, with
+Node 26.9.0:
+
+| test | old flip | page faults |
+|---|---|---|
+| two CPU-heavy workers | 0 of 5 survived | 20 of 20 |
+| four workers with polymorphic code, busy main thread | 0 of 3 | 25 of 25 |
+
+Ten runs in each row had V8's background threads on. It is faster too,
+because a write no longer re-protects 256 MB per isolate twice:
+
+| benchmark | old flip | page faults |
+|---|---|---|
+| JSON round trips | 200–329 ms | 156–179 ms |
+| property access on mixed shapes | 115–117 ms | 62–65 ms |
+
+The shim still forces V8 `--single-threaded`, conservatively, though the
+worker tests pass without it. The flag is rejected in `NODE_OPTIONS`, which
+rules out the obvious way to reach child processes. Node exports
+`v8::V8::SetFlagsFromString`, though, so the shim sets the flag from a library
+constructor — before `main`, long before `V8::Initialize`. That covers every
+route into the binary: the command line, a `#!/usr/bin/env node` shebang, and
+anything npm spawns through `process.execPath`. `NODEIOS_V8_FLAGS` overrides
+it; the empty string opts out.
+
+A Node patched before this change links the shim but does not route
+`sigaction`, `mprotect` or `munmap` through it, and would crash beside the new
+shim. `node-ios-patch` therefore asks the patcher whether a binary is current
+rather than whether it links the shim, and patches it again if not. The patcher
+reuses the existing load command, so the result is byte-identical to patching
+from scratch.
 
 ## The other iOS problems, and what they cost
 
@@ -136,13 +175,12 @@ that anything `nvm install` brings down is patched and signed before you use it.
   target of 11.0, so the linker emits classic `LC_DYLD_INFO_ONLY` bind opcodes
   instead of chained fixups. Repointing those means rewriting the bind opcode
   stream, which this port does not do. `tools/resolve-version.sh` refuses them.
-- **`worker_threads` is reliable up to two workers.** Beyond that the
-  process-wide W^X flip races and the process takes SIGBUS — a worker isolate
-  compiling while the main isolate executes. Per-thread region ownership was
-  tried and does not fix it: some regions are legitimately written off their
-  mapping thread, and restricting the flip turns the crash into a write fault
-  instead. `NODEIOS_V8_FLAGS=--jitless` is thread-safe and handles eight workers
-  reliably, at interpreter speed and without WebAssembly.
+- **Creating many workers in quick succession can run out of address space.**
+  With the JIT on, each isolate reserves a 256 MB code range plus V8's tables,
+  and iOS gives a process far less address space than macOS. Starting 40
+  workers four at a time failed with `Fatal process out of memory` in 6 of 22
+  runs; the same test with `NODEIOS_V8_FLAGS=--jitless` passed every
+  time. Workers that live for a while are unaffected.
 - **Prebuilt native addons do not load.** A `.node` from npm is a macOS
   build, and dyld refuses it as the wrong platform. `node-ios-patch` cannot
   convert one yet: it patches node itself, and refuses a file without V8's JIT

@@ -11,8 +11,13 @@ Pure stdlib and no cctools dependency, so it can also run on the phone
      inside LC_DYLD_CHAINED_FIXUPS
   4. rewrite any ".framework/Versions/X/Foo" dlopen path left in the data
 
+Patching is idempotent. A binary patched by an earlier version already links
+the shim; its load command is reused and only the imports this version adds
+are repointed, so a newer shim never runs beside a binary that bypasses it.
+
   nodeios_patch.py <in> <out> [--shim @executable_path/libnodeshim.dylib]
   nodeios_patch.py <in> --check          # report only, write nothing
+  nodeios_patch.py <in> --current        # exit 0 only if nothing is left to patch
 
 Exit status is non-zero if the binary is not one we know how to patch, so the
 build can refuse to ship it.
@@ -34,13 +39,22 @@ CPU_TYPE_ARM64 = 0x0100000C
 IOS_MINOS = (15, 0, 0)
 IOS_SDK   = (17, 0, 0)
 
-# Without these two nothing runs: mmap is interposed so MAP_JIT can be stripped
-# and the region remembered, and pthread_jit_write_protect_np (absent from iOS
-# altogether) is what V8 calls to flip that region between writable and
-# executable. Their absence means the binary is not a V8 build we understand.
+# Without these nothing runs: mmap is interposed so MAP_JIT can be stripped
+# and the code range remembered, and pthread_jit_write_protect_np (absent from
+# iOS altogether) is what V8 calls around every write to code. Their absence
+# means the binary is not a V8 build we understand.
 REQUIRED = [
     "_mmap",
     "_pthread_jit_write_protect_np",
+    # The shim repairs JIT page faults instead of flipping whole code ranges,
+    # which is what makes worker threads safe. That needs its SIGBUS/SIGSEGV
+    # handler to stay in front of V8's and Node's (sigaction), and a true record
+    # of every code page's protection: V8 reserves ranges with no access and
+    # grants it with mprotect, and unmaps a worker's range when it exits. Without
+    # any one of these repointed, the first execution of JIT code would crash.
+    "_sigaction",
+    "_mprotect",
+    "_munmap",
 ]
 
 # Repointed when present, skipped when not. Which of these a given Node build
@@ -56,6 +70,9 @@ OPTIONAL = [
     "_posix_spawnp",
     "_execve",
     "_execvp",
+    # signal() would otherwise install a SIGBUS/SIGSEGV handler past the
+    # interposed sigaction().
+    "_signal",
 ]
 
 SHIMMED = REQUIRED + OPTIONAL
@@ -182,6 +199,18 @@ class MachO(object):
                 found[name] = (i, v & 0xFF, (v >> 8) & 1, name_off)
         return base, found
 
+    def shim_ordinal(self, shim_path):
+        for i, (name, _, _, _) in enumerate(self.dylibs(), 1):
+            if name == shim_path:
+                return i
+        return None
+
+    def unshimmed(self, shim_path):
+        """Imports this version routes to the shim that still go elsewhere."""
+        ordinal = self.shim_ordinal(shim_path)
+        _, found = self.find_imports(set(SHIMMED))
+        return [n for n in SHIMMED if n in found and found[n][1] != ordinal]
+
     def add_shim(self, shim_path):
         base, found = self.find_imports(set(SHIMMED))
         missing = [n for n in REQUIRED if n not in found]
@@ -193,26 +222,32 @@ class MachO(object):
         path = shim_path.encode() + b"\0"
         cmdsize = (24 + len(path) + 7) & ~7
         slack = self.text_start() - (32 + self.sizeofcmds)
-        if cmdsize > slack:
+        if self.shim_ordinal(shim_path) is None and cmdsize > slack:
             raise SystemExit("no header room for LC_LOAD_DYLIB: need %d, have %d"
                              % (cmdsize, slack))
 
-        new_ord = len(self.dylibs()) + 1
-        ins = 32 + self.sizeofcmds
-        lc = struct.pack("<IIIIII", LC_LOAD_DYLIB, cmdsize, 24, 0, 0x10000, 0x10000)
-        lc += path + b"\0" * (cmdsize - 24 - len(path))
-        self.d[ins:ins + cmdsize] = lc
-        self.ncmds += 1
-        self.sizeofcmds += cmdsize
-        struct.pack_into("<II", self.d, 16, self.ncmds, self.sizeofcmds)
-        print("  + LC_LOAD_DYLIB ordinal %d -> %s (%d bytes, %d slack left)"
-              % (new_ord, shim_path, cmdsize, slack - cmdsize))
+        new_ord = self.shim_ordinal(shim_path)
+        if new_ord is not None:
+            print("  = LC_LOAD_DYLIB ordinal %d -> %s (already linked)" % (new_ord, shim_path))
+        else:
+            new_ord = len(self.dylibs()) + 1
+            ins = 32 + self.sizeofcmds
+            lc = struct.pack("<IIIIII", LC_LOAD_DYLIB, cmdsize, 24, 0, 0x10000, 0x10000)
+            lc += path + b"\0" * (cmdsize - 24 - len(path))
+            self.d[ins:ins + cmdsize] = lc
+            self.ncmds += 1
+            self.sizeofcmds += cmdsize
+            struct.pack_into("<II", self.d, 16, self.ncmds, self.sizeofcmds)
+            print("  + LC_LOAD_DYLIB ordinal %d -> %s (%d bytes, %d slack left)"
+                  % (new_ord, shim_path, cmdsize, slack - cmdsize))
 
         for name in SHIMMED:
             if name not in found:
                 print("    (skipped %s -- not imported by this build)" % name)
                 continue
             i, lib_ord, weak, name_off = found[name]
+            if lib_ord == new_ord:
+                continue
             struct.pack_into("<I", self.d, base + i * 4,
                              (new_ord & 0xFF) | (weak << 8) | (name_off << 9))
             print("    import[%d] %s: ordinal %d -> %d" % (i, name, lib_ord, new_ord))
@@ -253,12 +288,20 @@ def main():
 
     m = MachO(open(src, "rb").read())
 
+    if "--current" in sys.argv:
+        left = m.unshimmed(shim) if m.shim_ordinal(shim) else ["the shim itself"]
+        if left:
+            print("not current: %s" % ", ".join(left))
+            raise SystemExit(1)
+        print("current")
+        return
+
     libs = [n for n, _, _, _ in m.dylibs()]
     print("linked dylibs:")
     for i, n in enumerate(libs, 1):
-        mark = "" if n in ALLOWED_DYLIBS else "   <== NOT KNOWN TO EXIST ON iOS"
+        mark = "" if n in ALLOWED_DYLIBS or n == shim else "   <== NOT KNOWN TO EXIST ON iOS"
         print("  %d: %s%s" % (i, n, mark))
-    unknown = [n for n in libs if n not in ALLOWED_DYLIBS]
+    unknown = [n for n in libs if n not in ALLOWED_DYLIBS and n != shim]
     if unknown:
         raise SystemExit("refusing: unexpected dylib dependency: %s" % ", ".join(unknown))
 

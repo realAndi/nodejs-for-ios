@@ -26,10 +26,12 @@ Description: Node.js @NODE_VERSION@ with npm and working nvm, patched for iOS
  The shim is what makes V8 run. iOS rejects MAP_JIT and kills a process that
  executes a writable page, and pthread_jit_write_protect_np -- the call V8's
  arm64 Darwin build uses to flip its code pages -- does not exist on iOS at
- all. The shim strips MAP_JIT, remembers the region, and implements the flip
- with mprotect. That flip is process-wide where the real API is per-thread, so
- the shim also forces V8 --single-threaded, which is the one setting that
- survives a `#!/usr/bin/env node` shebang and anything npm spawns.
+ all. The shim strips MAP_JIT and keeps each page of V8's code ranges
+ writable or executable, repairing the fault when a thread needs the other,
+ one page at a time. That makes worker threads safe. It also forces V8
+ --single-threaded, conservatively, from a library constructor, which is the
+ one route that survives a `#!/usr/bin/env node` shebang and anything npm
+ spawns.
  .
  It also remaps /bin/sh and friends into the bootstrap prefix, because a
  rootless jailbreak has no /bin/sh and Node hard-codes it for `shell: true` --
@@ -48,6 +50,6 @@ Description: Node.js @NODE_VERSION@ with npm and working nvm, patched for iOS
  each version nvm installs. Node 24 and newer only; 23 and earlier use a Mach-O
  bind format this port cannot rewrite.
  .
- Known limit: worker_threads is reliable up to two workers. Beyond that the
- process-wide W^X flip races and the process takes SIGBUS. Run with
- NODEIOS_V8_FLAGS=--jitless for worker-heavy work, which is slower but safe.
+ Known limit: creating many worker threads in quick succession can exhaust
+ the address space iOS gives a process. NODEIOS_V8_FLAGS=--jitless avoids it,
+ at interpreter speed.

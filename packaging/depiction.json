@@ -61,7 +61,7 @@
           "class": "DepictionMarkdownView",
           "useSpacing": true,
           "useRawFormat": false,
-          "markdown": "iOS rejects `MAP_JIT` with EINVAL and kills a process that executes a writable page, but it will let `mprotect` swing a page between read-write and read-execute. And `pthread_jit_write_protect_np`, the call V8's arm64 Darwin build uses to flip its code pages, does not exist on iOS at all.\n\nSo the shim strips `MAP_JIT`, remembers the region, and implements the flip with `mprotect`. That is process-wide where the real API is per-thread, so the shim also forces V8 `--single-threaded` from a library constructor — the one route that survives a `#!/usr/bin/env node` shebang and anything npm spawns."
+          "markdown": "iOS rejects `MAP_JIT` with EINVAL and kills a process that executes a writable page, but it will let `mprotect` swing a page between read-write and read-execute. And `pthread_jit_write_protect_np`, the call V8's arm64 Darwin build uses to flip its code pages, does not exist on iOS at all.\n\nSo the shim strips `MAP_JIT` and keeps each page of V8's code writable or executable, repairing the fault one page at a time when a thread needs the other. That is what makes worker threads safe. It also forces V8 `--single-threaded`, conservatively, from a library constructor — the one route that survives a `#!/usr/bin/env node` shebang and anything npm spawns."
         }
       ]
     },
@@ -156,7 +156,7 @@
           "class": "DepictionMarkdownView",
           "useSpacing": true,
           "useRawFormat": false,
-          "markdown": "**`worker_threads` is reliable up to two workers.** Past that, the process-wide W^X flip races a worker isolate compiling against the main isolate executing, and the process takes SIGBUS.\n\nFor worker-heavy work run with `NODEIOS_V8_FLAGS=--jitless`, which is slower but thread-safe. Eight workers pass reliably that way."
+          "markdown": "**`worker_threads` work.** Creating many workers in quick succession can run out of the address space iOS gives a process, because each one reserves its own code range.\n\nIf that happens, run with `NODEIOS_V8_FLAGS=--jitless`, which is slower but reserves none."
         },
         { "class": "DepictionSeparatorView" },
         {

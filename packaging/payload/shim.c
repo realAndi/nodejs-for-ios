@@ -5,18 +5,16 @@
  *  entitled binary, and the two-level import table would never pick an
  *  inserted library anyway.
  *
- *  Three of Node's 725 imports are absent from iOS's libraries, plus mmap is
- *  interposed for JIT:
+ *  Three of Node's 725 imports are absent from iOS's libraries; the rest of
+ *  what is interposed here is for JIT and for running programs:
  *
  *  1. pthread_jit_write_protect_np -- macOS-only (SDK marks it
- *     __API_UNAVAILABLE(ios); absent on iOS 17.3). V8's arm64 Darwin build
- *     maps its code pages MAP_JIT and flips per-thread W^X through this call.
- *     iOS rejects MAP_JIT (EINVAL) and SIGBUSes on executing a writable page,
- *     but mprotect() may swing a page RW<->RX. So: strip MAP_JIT in mmap,
- *     remember the region, and implement the toggle as mprotect over every
- *     remembered region. That is process-wide where the real API is
- *     per-thread, so node must run --single-threaded (or at least with
- *     concurrent recompilation off).
+ *     __API_UNAVAILABLE(ios); absent on iOS 17.3). V8's arm64 Darwin build maps
+ *     its code ranges MAP_JIT and flips W^X per thread through this call. iOS
+ *     rejects MAP_JIT and SIGBUSes on executing a writable page, but mprotect()
+ *     may move a page between RW and RX, so the shim repairs faults one page at
+ *     a time. mmap, mprotect, munmap, sigaction and signal are interposed for
+ *     it. See section 1.
  *
  *  2. SecTrustSettingsCopyTrustSettings -- macOS-only Security API behind
  *     Node's --use-system-ca. Report "no trust settings" so Node falls back to
@@ -41,19 +39,25 @@
  */
 
 #include <sys/mman.h>
+#include <sys/ucontext.h>
 #include <libkern/OSCacheControl.h>
 #include <crt_externs.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <syslog.h>
 #include <pthread.h>
 #include <spawn.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -61,18 +65,7 @@
 #define MAP_JIT 0x0800
 #endif
 
-#define MAX_JIT_REGIONS 256
-
-static struct { void *addr; size_t len; } g_jit[MAX_JIT_REGIONS];
-
-/* Whether *this* thread is currently inside a write scope. V8 enters the scope
-   and only then maps the code range it is about to write into, so a region
-   mapped while the flag is set must come up read-write or the very next store
-   faults. */
-static _Thread_local int t_write_scope = 0;
-static int             g_jit_count = 0;
-static pthread_mutex_t g_jit_lock  = PTHREAD_MUTEX_INITIALIZER;
-static int             g_debug     = -1;
+static int g_debug = -1;
 
 static int debug_on(void) {
     if (g_debug < 0) g_debug = getenv("NODEIOS_SHIM_DEBUG") != NULL;
@@ -103,71 +96,473 @@ static void *real_sym(const char *name, void *self) {
 
 /* ---- 1. JIT memory ----------------------------------------------------- */
 
+/* V8's arm64 Darwin build reserves each isolate's code range with MAP_JIT and
+   flips W^X through pthread_jit_write_protect_np(), which is per thread: the
+   thread writing code sees its pages read-write while every other thread keeps
+   executing them read-execute. iOS has neither. It rejects MAP_JIT (EINVAL),
+   will not execute a page that is writable (SIGBUS), and refuses RWX even for a
+   process jbctl has marked debugged -- but mprotect() may move a page between
+   RW and RX, and a fault on the wrong one can be repaired and retried.
+
+   This shim used to mprotect() every code range on every call. That is
+   process-wide, so a worker isolate compiling pulled the main isolate's code
+   out from under it: two CPU-heavy workers died with SIGBUS every time. So now
+   nothing is flipped eagerly. Each page is RW or RX, and faults decide:
+
+     write fault, thread inside a write scope   make that page RW, and count
+                                                this thread as its writer
+     execute fault                              wait until no thread is still
+                                                writing the page, make it RX
+     leaving the write scope                    drop this thread's writer
+                                                counts; pages stay as they are
+
+   The faulting instruction then runs again. Per thread, that is what the real
+   API gives V8. Pages that are only ever executed stop faulting after their
+   first run.
+
+   V8 reserves a range with no access and grants access later with mprotect(),
+   and unmaps the whole range when a worker isolate goes away. So mprotect and
+   munmap are interposed as well, to keep the per-page record true: a request
+   for RWX on a code page is granted as RW, which is what it can be on iOS, and
+   an unmapped range stops being tracked.
+
+   The fault handler has to run before V8's WebAssembly trap handler and Node's
+   own, so it is installed from the constructor and sigaction() and signal() are
+   interposed for SIGBUS and SIGSEGV: their handlers are recorded and chained
+   to for every fault that is not one of ours. */
+
+#define MAX_JIT_REGIONS 256
+#define MAX_TOUCHED     512      /* pages one thread writes per scope, counted */
+
+enum { PAGE_RW = 0, PAGE_RX = 1, PAGE_FOREIGN = 2 };
+
+typedef struct {
+    _Atomic uintptr_t start, end;  /* end == 0: slot free */
+    size_t    npages, capacity;    /* capacity: pages the arrays below can hold */
+    uint32_t  gen;                 /* bumped when the slot is reused */
+    uint8_t  *state;               /* PAGE_*, authoritative while g_lock is held */
+    uint16_t *writers;             /* threads in a write scope that wrote the page */
+} jit_region_t;
+
+typedef struct {
+    int writing;
+    int ntouched;
+    struct { jit_region_t *r; uint32_t gen; size_t page; } touched[MAX_TOUCHED];
+} writer_t;
+
+static jit_region_t    g_regions[MAX_JIT_REGIONS];
+static atomic_int      g_nregions;             /* slots ever used; only grows */
+static atomic_flag     g_lock = ATOMIC_FLAG_INIT;
+static pthread_mutex_t g_register_lock = PTHREAD_MUTEX_INITIALIZER;
+static size_t          g_page;
+static pthread_key_t   g_writer_key;
+
+static atomic_ulong    g_write_faults, g_exec_faults, g_waits, g_chained;
+
 typedef void *(*mmap_fn)(void *, size_t, int, int, int, off_t);
+typedef int   (*mprotect_fn)(void *, size_t, int);
+typedef int   (*munmap_fn)(void *, size_t);
+typedef int   (*sigaction_fn)(int, const struct sigaction *, struct sigaction *);
+
+static mmap_fn      real_mmap;
+static mprotect_fn  real_mprotect;
+static munmap_fn    real_munmap;
+static sigaction_fn real_sigaction;
+
+/* Spin lock: taken inside a signal handler, where a mutex is not safe. Every
+   critical section is a few assignments and at most one mprotect. */
+static void jit_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_lock, memory_order_acquire))
+        sched_yield();
+}
+static void jit_unlock(void) { atomic_flag_clear_explicit(&g_lock, memory_order_release); }
+
+static jit_region_t *find_region(uintptr_t a, size_t *page) {
+    int n = atomic_load(&g_nregions);
+    for (int i = 0; i < n; i++) {
+        jit_region_t *r = &g_regions[i];
+        uintptr_t start = atomic_load(&r->start), end = atomic_load(&r->end);
+        if (a >= start && a < end) {
+            *page = (a - start) / g_page;
+            return r;
+        }
+    }
+    return NULL;
+}
+
+static uint8_t state_for_prot(int prot) {
+    int wx = prot & (PROT_WRITE | PROT_EXEC);
+    if (!(prot & PROT_READ)) return PAGE_FOREIGN;  /* PROT_NONE: reserved, not committed */
+    if (wx == PROT_WRITE || wx == (PROT_WRITE | PROT_EXEC)) return PAGE_RW;
+    if (wx == PROT_EXEC) return PAGE_RX;
+    return PAGE_FOREIGN;
+}
+
+/* Record that [a, a+len) now has protection `prot`. */
+static void note_protection(uintptr_t a, size_t len, int prot) {
+    int n = atomic_load(&g_nregions);
+    for (int i = 0; i < n; i++) {
+        jit_region_t *r = &g_regions[i];
+        uintptr_t start = atomic_load(&r->start), end = atomic_load(&r->end);
+        uintptr_t lo = a > start ? a : start;
+        uintptr_t hi = a + len < end ? a + len : end;
+        if (lo >= hi) continue;
+        size_t first = (lo - start) / g_page;
+        size_t last  = (hi - start + g_page - 1) / g_page;
+        uint8_t st = state_for_prot(prot);
+        jit_lock();
+        for (size_t p = first; p < last; p++) r->state[p] = st;
+        jit_unlock();
+    }
+}
+
+static int overlaps_region(uintptr_t a, size_t len) {
+    int n = atomic_load(&g_nregions);
+    for (int i = 0; i < n; i++) {
+        uintptr_t start = atomic_load(&g_regions[i].start), end = atomic_load(&g_regions[i].end);
+        if (a < end && a + len > start) return 1;
+    }
+    return 0;
+}
+
+static void register_region(void *p, size_t len, int prot) {
+    size_t dummy;
+    if (find_region((uintptr_t)p, &dummy) != NULL) {   /* MAP_FIXED inside a range */
+        note_protection((uintptr_t)p, len, prot);
+        return;
+    }
+    size_t npages = (len + g_page - 1) / g_page;
+    pthread_mutex_lock(&g_register_lock);
+    jit_region_t *r = NULL;
+    int n = atomic_load(&g_nregions);
+    for (int i = 0; i < n && r == NULL; i++)             /* a free slot big enough */
+        if (atomic_load(&g_regions[i].end) == 0 && g_regions[i].capacity >= npages)
+            r = &g_regions[i];
+    if (r == NULL) {
+        if (n >= MAX_JIT_REGIONS) {
+            pthread_mutex_unlock(&g_register_lock);
+            fprintf(stderr, "[node-ios] fatal: more than %d JIT code ranges\n", MAX_JIT_REGIONS);
+            abort();
+        }
+        r = &g_regions[n];
+        size_t bytes = npages * (sizeof *r->state + sizeof *r->writers);
+        void *mem = real_mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (mem == MAP_FAILED) {
+            pthread_mutex_unlock(&g_register_lock);
+            fprintf(stderr, "[node-ios] fatal: cannot allocate JIT page state\n");
+            abort();
+        }
+        r->state    = mem;
+        r->writers  = (uint16_t *)((uint8_t *)mem + npages);
+        r->capacity = npages;
+    }
+    jit_lock();
+    r->npages = npages;
+    r->gen++;
+    memset(r->state, state_for_prot(prot), npages);
+    memset(r->writers, 0, npages * sizeof *r->writers);
+    jit_unlock();
+    atomic_store(&r->start, (uintptr_t)p);
+    atomic_store(&r->end, (uintptr_t)p + npages * g_page);   /* live from here */
+    if (r == &g_regions[n]) atomic_store(&g_nregions, n + 1);
+    pthread_mutex_unlock(&g_register_lock);
+
+    if (debug_on())
+        fprintf(stderr, "[node-ios] JIT range %p len=%zu prot=0x%x\n", p, len, prot);
+}
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
-    static mmap_fn real = NULL;
-    if (real == NULL) real = (mmap_fn)real_sym("mmap", (void *)mmap);
-
-    if ((flags & MAP_JIT) == 0)
-        return real(addr, len, prot, flags, fd, offset);
-
-    /* V8's executable pool. Map it RW now; the toggle below swings it to RX
-       once V8 is ready to run what it wrote. */
+    if ((flags & MAP_JIT) == 0) {
+        void *p = real_mmap(addr, len, prot, flags, fd, offset);
+        if (p != MAP_FAILED && (flags & MAP_FIXED)) note_protection((uintptr_t)p, len, prot);
+        return p;
+    }
+    /* A code range. RWX is never granted; RW is, and the first execution of
+       each page makes it RX. */
     flags &= ~MAP_JIT;
     int initial = prot;
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) initial = prot & ~PROT_EXEC;
-    if (t_write_scope) initial = PROT_READ | PROT_WRITE;
-
-    void *p = real(addr, len, initial, flags, fd, offset);
-    if (p == MAP_FAILED) return p;
-
-    pthread_mutex_lock(&g_jit_lock);
-    if (g_jit_count < MAX_JIT_REGIONS) {
-        g_jit[g_jit_count].addr  = p;
-        g_jit[g_jit_count].len   = len;
-        g_jit_count++;
-    }
-    pthread_mutex_unlock(&g_jit_lock);
-
-    if (debug_on())
-        fprintf(stderr, "[node-ios] JIT pool %p len=%zu prot=0x%x->0x%x (%d tracked)\n",
-                p, len, prot, initial, g_jit_count);
+    void *p = real_mmap(addr, len, initial, flags, fd, offset);
+    if (p != MAP_FAILED) register_region(p, len, initial);
     return p;
 }
 
-/* enabled=0: "about to write"; enabled=1: "done, must be executable again".
+int mprotect(void *addr, size_t len, int prot) {
+    if ((prot & PROT_WRITE) && (prot & PROT_EXEC) && overlaps_region((uintptr_t)addr, len))
+        prot &= ~PROT_EXEC;
+    int rc = real_mprotect(addr, len, prot);
+    if (rc == 0) note_protection((uintptr_t)addr, len, prot);
+    return rc;
+}
 
-   Only the calling thread's own regions are flipped. mprotect is process-wide
-   while the API it stands in for is per-thread, so flipping every region would
-   make a worker isolate's compile step unmap the main isolate's executable
-   pages mid-instruction -- an intermittent SIGBUS that scales with the worker
-   count. Each isolate gets its own code range, allocated on the thread that
-   created it, so owner-filtering restores the per-thread semantics V8 expects.
-   If the caller owns nothing (a thread writing a range it did not map), fall
-   back to flipping everything: slower and racy, but never wrong-by-omission.
-
-   A region can be unmapped while still listed (isolate teardown), after which
-   mprotect fails harmlessly -- drop it rather than abort. */
-void pthread_jit_write_protect_np(int enabled) {
-    int prot = enabled ? (PROT_READ | PROT_EXEC) : (PROT_READ | PROT_WRITE);
-
-    t_write_scope = !enabled;
-
-    pthread_mutex_lock(&g_jit_lock);
-    for (int i = 0; i < g_jit_count; i++) {
-        if (mprotect(g_jit[i].addr, g_jit[i].len, prot) != 0) {
-            if (debug_on())
-                fprintf(stderr, "[node-ios] mprotect(%p, %zu, 0x%x) failed: %d -- dropping\n",
-                        g_jit[i].addr, g_jit[i].len, prot, errno);
-            g_jit[i] = g_jit[--g_jit_count];
-            i--;
+int munmap(void *addr, size_t len) {
+    int rc = real_munmap(addr, len);
+    if (rc != 0) return rc;
+    uintptr_t a = (uintptr_t)addr;
+    int n = atomic_load(&g_nregions);
+    for (int i = 0; i < n; i++) {
+        jit_region_t *r = &g_regions[i];
+        uintptr_t start = atomic_load(&r->start), end = atomic_load(&r->end);
+        if (end == 0 || a >= end || a + len <= start) continue;
+        if (a <= start && a + len >= end) {
+            pthread_mutex_lock(&g_register_lock);
+            atomic_store(&r->end, 0);                 /* not live from here */
+            pthread_mutex_unlock(&g_register_lock);
+            if (debug_on()) fprintf(stderr, "[node-ios] JIT range %p unmapped\n", (void *)start);
+        } else {
+            note_protection(a, len, PROT_NONE);
         }
     }
-    pthread_mutex_unlock(&g_jit_lock);
+    return 0;
+}
+
+static writer_t *current_writer(void) { return pthread_getspecific(g_writer_key); }
+
+static void check_handlers(void);
+
+/* enabled=0: "about to write"; enabled=1: "done, must be executable again". */
+void pthread_jit_write_protect_np(int enabled) {
+    writer_t *w = current_writer();
+    if (!enabled) {
+        if (w == NULL) {
+            /* Allocated here, in normal context, so the fault handler only ever
+               reads it. */
+            w = calloc(1, sizeof *w);
+            if (w == NULL) abort();
+            pthread_setspecific(g_writer_key, w);
+        }
+        w->writing = 1;
+        check_handlers();
+        return;
+    }
+    if (w == NULL || !w->writing) return;
+    if (w->ntouched > 0) {
+        jit_lock();
+        for (int i = 0; i < w->ntouched; i++) {
+            jit_region_t *r = w->touched[i].r;
+            size_t pg = w->touched[i].page;
+            if (r->gen == w->touched[i].gen && r->writers[pg] > 0) r->writers[pg]--;
+        }
+        jit_unlock();
+        w->ntouched = 0;
+    }
+    w->writing = 0;
 }
 
 int pthread_jit_write_protect_supported_np(void) { return 1; }
+
+/* A write to a code page. Only a thread inside a write scope may make one;
+   anything else is a real bug and goes to the chained handler. */
+static int repair_write(jit_region_t *r, size_t page) {
+    writer_t *w = current_writer();
+    if (w == NULL || !w->writing) return 0;
+    atomic_fetch_add(&g_write_faults, 1);
+    int ok = 1;
+    jit_lock();
+    if (page >= r->npages || r->state[page] == PAGE_FOREIGN) {
+        ok = 0;
+    } else {
+        int seen = 0;
+        for (int i = 0; i < w->ntouched; i++)
+            if (w->touched[i].r == r && w->touched[i].page == page && w->touched[i].gen == r->gen) {
+                seen = 1;
+                break;
+            }
+        /* Past MAX_TOUCHED the page goes uncounted. Still correct -- every access
+           faults and is repaired -- just liable to bounce between a writer and an
+           executor until the scope ends. */
+        if (!seen && w->ntouched < MAX_TOUCHED) {
+            w->touched[w->ntouched].r    = r;
+            w->touched[w->ntouched].gen  = r->gen;
+            w->touched[w->ntouched].page = page;
+            w->ntouched++;
+            r->writers[page]++;
+        }
+        if (r->state[page] == PAGE_RX) {
+            if (real_mprotect((void *)(atomic_load(&r->start) + page * g_page), g_page,
+                              PROT_READ | PROT_WRITE) == 0)
+                r->state[page] = PAGE_RW;
+            else
+                ok = 0;
+        }
+    }
+    jit_unlock();
+    return ok;
+}
+
+/* An execution of a code page. Waits out any thread still writing it. */
+static int repair_exec(jit_region_t *r, size_t page) {
+    writer_t *w = current_writer();
+    /* On macOS a thread inside its own write scope cannot execute JIT code
+       either. Crash the same way rather than wait on ourselves forever. */
+    if (w != NULL && w->writing) return 0;
+    atomic_fetch_add(&g_exec_faults, 1);
+    for (unsigned spins = 0;; spins++) {
+        jit_lock();
+        if (page >= r->npages || r->state[page] == PAGE_FOREIGN) { jit_unlock(); return 0; }
+        if (r->writers[page] == 0) {
+            int ok = 1;
+            if (r->state[page] == PAGE_RW) {
+                if (real_mprotect((void *)(atomic_load(&r->start) + page * g_page), g_page,
+                                  PROT_READ | PROT_EXEC) == 0)
+                    r->state[page] = PAGE_RX;
+                else
+                    ok = 0;
+            }
+            jit_unlock();
+            return ok;
+        }
+        jit_unlock();
+        if (spins == 0) atomic_fetch_add(&g_waits, 1);
+        if (spins < 64) {
+            sched_yield();
+        } else {
+            struct timespec ts = { 0, 50000 };   /* 50 us */
+            nanosleep(&ts, NULL);
+        }
+    }
+}
+
+/* ---- fault handler ordering ------------------------------------------- */
+
+static struct sigaction g_app[2];          /* SIGBUS, SIGSEGV as the program set them */
+static atomic_flag      g_sig_lock = ATOMIC_FLAG_INIT;
+
+static struct sigaction *app_slot(int sig) {
+    return sig == SIGBUS ? &g_app[0] : sig == SIGSEGV ? &g_app[1] : NULL;
+}
+static void sig_lock(void)   { while (atomic_flag_test_and_set(&g_sig_lock)) sched_yield(); }
+static void sig_unlock(void) { atomic_flag_clear(&g_sig_lock); }
+
+static void chain(int sig, siginfo_t *si, void *ctx) {
+    atomic_fetch_add(&g_chained, 1);
+    sig_lock();
+    struct sigaction app = *app_slot(sig);
+    if (app.sa_flags & SA_RESETHAND) {
+        memset(app_slot(sig), 0, sizeof app);
+        app_slot(sig)->sa_handler = SIG_DFL;
+    }
+    sig_unlock();
+
+    int has_info = (app.sa_flags & SA_SIGINFO) != 0;
+    if ((has_info && app.sa_sigaction != NULL) ||
+        (!has_info && app.sa_handler != SIG_DFL && app.sa_handler != SIG_IGN)) {
+        sigset_t saved;
+        pthread_sigmask(SIG_BLOCK, &app.sa_mask, &saved);
+        if (has_info) app.sa_sigaction(sig, si, ctx);
+        else          app.sa_handler(sig);
+        pthread_sigmask(SIG_SETMASK, &saved, NULL);
+        return;
+    }
+    /* Default action: restore it for real and raise the signal again. It stays
+       pending until this handler returns, then kills the process the way it
+       would have without the shim. Returning alone is not enough: a signal
+       that was sent rather than faulted -- kill(), or Node resetting its
+       handler and calling raise() -- would never arrive a second time. */
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    real_sigaction(sig, &dfl, NULL);
+    raise(sig);
+}
+
+static void jit_fault(int sig, siginfo_t *si, void *ctx) {
+    uintptr_t far = (uintptr_t)si->si_addr;
+    size_t page;
+    jit_region_t *r = find_region(far, &page);
+    if (r != NULL) {
+        ucontext_t *uc = ctx;
+        uint32_t esr = uc->uc_mcontext->__es.__esr;
+        uintptr_t pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+        unsigned ec = esr >> 26;
+        int exec  = ec == 0x20 || ec == 0x21 || pc == far;          /* instruction abort */
+        int write = !exec && (ec == 0x24 || ec == 0x25) && (esr & (1u << 6));  /* data abort, WnR */
+        if (exec  && repair_exec(r, page))  return;
+        if (write && repair_write(r, page)) return;
+    }
+    chain(sig, si, ctx);
+}
+
+static void install_handler(int sig) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = jit_fault;
+    /* SA_ONSTACK so that a chained handler still gets the alternate stack it
+       asked for, which is what makes a stack overflow reportable. */
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    real_sigaction(sig, &sa, NULL);
+}
+
+/* Belt and braces for the interposition: if a handler was installed past it,
+   adopt that one as the chained handler and put ours back in front. Cheap
+   enough to run on the first write scopes and then every few thousand. */
+static void check_handlers(void) {
+    static atomic_ulong calls;
+    unsigned long c = atomic_fetch_add(&calls, 1);
+    if (c > 16 && (c & 4095) != 0) return;
+    static const int sigs[2] = { SIGBUS, SIGSEGV };
+    for (int i = 0; i < 2; i++) {
+        struct sigaction cur;
+        if (real_sigaction(sigs[i], NULL, &cur) != 0) continue;
+        if ((cur.sa_flags & SA_SIGINFO) && cur.sa_sigaction == jit_fault) continue;
+        sig_lock();
+        *app_slot(sigs[i]) = cur;
+        sig_unlock();
+        install_handler(sigs[i]);
+        if (debug_on()) fprintf(stderr, "[node-ios] reinstalled fault handler for %d\n", sigs[i]);
+    }
+}
+
+int sigaction(int sig, const struct sigaction *act, struct sigaction *oact) {
+    struct sigaction *slot = app_slot(sig);
+    if (slot == NULL) return real_sigaction(sig, act, oact);
+    sig_lock();
+    if (oact != NULL) *oact = *slot;
+    if (act != NULL)  *slot = *act;
+    sig_unlock();
+    return 0;
+}
+
+void (*signal(int sig, void (*func)(int)))(int) {
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = func;
+    sa.sa_flags = SA_RESTART;                    /* BSD signal() semantics */
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(sig, &sa, &old) != 0) return SIG_ERR;
+    return (old.sa_flags & SA_SIGINFO) ? (void (*)(int))(uintptr_t)old.sa_sigaction
+                                       : old.sa_handler;
+}
+
+static void report_counters(void) {
+    fprintf(stderr, "[node-ios] JIT faults: write %lu, exec %lu, waited %lu, chained %lu\n",
+            atomic_load(&g_write_faults), atomic_load(&g_exec_faults),
+            atomic_load(&g_waits), atomic_load(&g_chained));
+}
+
+/* Runs before section 6's constructor sets V8's flags, and before main. */
+__attribute__((constructor(101)))
+static void nodeios_jit_init(void) {
+    real_mmap      = (mmap_fn)real_sym("mmap", (void *)mmap);
+    real_mprotect  = (mprotect_fn)real_sym("mprotect", (void *)mprotect);
+    real_munmap    = (munmap_fn)real_sym("munmap", (void *)munmap);
+    real_sigaction = (sigaction_fn)real_sym("sigaction", (void *)sigaction);
+    if (!real_mmap || !real_mprotect || !real_munmap || !real_sigaction) {
+        fprintf(stderr, "[node-ios] fatal: cannot resolve libSystem's memory or signal calls\n");
+        abort();
+    }
+    g_page = (size_t)sysconf(_SC_PAGESIZE);
+    if (pthread_key_create(&g_writer_key, free) != 0) abort();
+
+    real_sigaction(SIGBUS,  NULL, &g_app[0]);
+    real_sigaction(SIGSEGV, NULL, &g_app[1]);
+    install_handler(SIGBUS);
+    install_handler(SIGSEGV);
+
+    if (debug_on()) atexit(report_counters);
+}
 
 /* ---- 2. macOS-only Security API ---------------------------------------- */
 

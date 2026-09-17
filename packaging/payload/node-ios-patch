@@ -55,8 +55,13 @@ fi
 dir="$(cd "$(dirname "$bin")" && pwd)"
 bin="$dir/$(basename "$bin")"
 
-# Already patched? The shim load command is the marker.
-if otool -l "$bin" 2>/dev/null | grep -q libnodeshim.dylib; then
+# Already patched, by this version of the patcher? A binary patched by an
+# earlier version links the shim but may not route everything the current shim
+# relies on through it -- the JIT fault handling needs sigaction, mprotect and
+# munmap -- and the newer shim copied in below would then crash it on its first
+# JIT execution. The patcher is idempotent, so anything short of current is
+# simply patched again.
+if python3 "$PATCHER" "$bin" --current >/dev/null 2>&1; then
   echo "already patched: $bin"
 else
   # Patch via a temp file in the SAME directory: the replace must be an atomic

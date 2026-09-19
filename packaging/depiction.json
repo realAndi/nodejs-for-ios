@@ -124,7 +124,7 @@
           "class": "DepictionMarkdownView",
           "useSpacing": true,
           "useRawFormat": false,
-          "markdown": "- A rootless jailbreak (`/var/jb`). Tested on Dopamine.\n- iOS 15 or later, arm64. Tested on iOS 17.3, iPhone 15 Pro.\n- A network connection during install, for the 50 MB download.\n- About 220 MB once installed."
+          "markdown": "- A rootless jailbreak (`/var/jb`). Tested on Dopamine.\n- iOS 15 or later, arm64. Tested on iOS 17.3, iPhone 15 Pro.\n- An A12 chip or newer: iPhone XS/XR or later; on iPad, the 2018 iPad Pro, iPad Air 3, iPad mini 5, iPad 8th generation, or later. **A12-class devices are experimental:** the official build uses a few CPU instructions they lack, which are emulated, and some errors can occur. Older chips cannot run it; the install stops and says so.\n- A network connection during install, for the 50 MB download.\n- About 220 MB once installed."
         },
         { "class": "DepictionSeparatorView" },
         {

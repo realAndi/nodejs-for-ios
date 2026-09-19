@@ -8,6 +8,7 @@ Published as a Sileo/APT package at
 Package: com.andi.nodejs
 Repo:    https://reallyitsandi.com/repo/
 Tested:  iPhone 15 Pro, iOS 17.3, Dopamine (rootless, /var/jb)
+         iPad Pro (A12X), iPadOS 15.6, Dopamine -- experimental, see below
 ```
 
 ## Why this is not a cross-compile
@@ -139,6 +140,19 @@ from scratch.
   and there is no `sysctl(8)`. Stock nvm therefore builds a
   `darwin-iPhone16,1` download URL, 404s, and falls back to a source compile
   that cannot work. `nodeios.sh` overrides `nvm_get_arch`.
+
+## A12-class CPUs and iOS 15
+
+Node's official build is compiled for M1-class CPUs. An A12 (iPhone XS/XR, the
+2018 iPad Pro, iPad Air 3, iPad mini 5, iPad 8th gen) lacks a few of the
+instructions it uses -- LDAPUR/STLUR, SHA3, SHA512, dot product -- and traps on
+them with SIGILL; section 7 of `shim.c` performs each one and steps over it.
+Support there is **experimental**. Older chips lack far more (atomics,
+load-acquire, JavaScript's float conversion), and the postinst refuses them
+before downloading anything.
+
+iOS 15's libc++ also lacks `std::__libcpp_verbose_abort`, which Node imports;
+without it dyld refuses to start Node at all. The shim supplies it (section 8).
 
 ## Global packages
 

@@ -64,6 +64,9 @@ OPTIONAL = [
     # macOS-only, genuinely absent from iOS.
     "_SecTrustSettingsCopyTrustSettings",
     "_syslog$DARWIN_EXTSN",
+    # std::__libcpp_verbose_abort: iOS 16's libc++ exports it, iOS 15's does
+    # not, and dyld refuses to start Node there without it.
+    "__ZNSt3__122__libcpp_verbose_abortEPKcz",
     # present on iOS; interposed so a rootless bootstrap's /var/jb paths are
     # found when Node asks for /bin/sh and friends.
     "_posix_spawn",

@@ -36,6 +36,14 @@
  *     npm installs is one. When a spawn or exec fails that way and the target
  *     is an executable #! script, the same four functions run its interpreter
  *     themselves, the way the kernel would have.
+ *
+ *  7. A12-class CPUs. The build targets M1-class ones and uses ARMv8.4+
+ *     instructions an A12 traps on; the SIGILL handler performs each one and
+ *     steps over it. sigaction and signal are interposed for SIGILL too.
+ *
+ *  8. std::__libcpp_verbose_abort -- absent from iOS 15's libc++, which makes
+ *     dyld refuse to start Node there. Print the message and abort, as libc++
+ *     does.
  */
 
 #include <sys/mman.h>
@@ -425,11 +433,12 @@ static int repair_exec(jit_region_t *r, size_t page) {
 
 /* ---- fault handler ordering ------------------------------------------- */
 
-static struct sigaction g_app[2];          /* SIGBUS, SIGSEGV as the program set them */
+static struct sigaction g_app[3];          /* SIGBUS, SIGSEGV, SIGILL as the program set them */
 static atomic_flag      g_sig_lock = ATOMIC_FLAG_INIT;
 
 static struct sigaction *app_slot(int sig) {
-    return sig == SIGBUS ? &g_app[0] : sig == SIGSEGV ? &g_app[1] : NULL;
+    return sig == SIGBUS ? &g_app[0] : sig == SIGSEGV ? &g_app[1]
+         : sig == SIGILL ? &g_app[2] : NULL;
 }
 static void sig_lock(void)   { while (atomic_flag_test_and_set(&g_sig_lock)) sched_yield(); }
 static void sig_unlock(void) { atomic_flag_clear(&g_sig_lock); }
@@ -484,10 +493,180 @@ static void jit_fault(int sig, siginfo_t *si, void *ctx) {
     chain(sig, si, ctx);
 }
 
+/* ---- 7. ARMv8.4+ instructions on A12-class CPUs ------------------------- */
+
+/* Node's official macOS build targets M1-class CPUs. Its compiler output
+   includes LDAPUR and STLUR (FEAT_LRCPC2, ARMv8.4) -- a load-acquire or
+   store-release with an immediate offset -- plus SHA3's three-way XORs and
+   DotProd's byte dot products, and OpenSSL's SHA512 rounds. An A12-class chip
+   is ARMv8.3 and traps on all of them with SIGILL. Each is a few lines of plain
+   arithmetic on the registers the signal context carries, so perform it here
+   and step over the instruction. LDAR is RCsc where LDAPUR is RCpc -- stronger,
+   never weaker. On an A13 or newer nothing here ever runs. */
+
+static atomic_ulong g_emulated;
+
+static uint64_t *gpr(arm_thread_state64_t *ss, unsigned r) {
+    if (r < 29)  return &ss->__x[r];
+    if (r == 29) return &ss->__fp;
+    if (r == 30) return &ss->__lr;
+    return NULL;                               /* 31: sp as a base, zr as data */
+}
+
+static int emulate_lrcpc2(ucontext_t *uc) {
+    arm_thread_state64_t *ss = &uc->uc_mcontext->__ss;
+    uint32_t insn = *(const uint32_t *)(uintptr_t)ss->__pc;
+    /* size:2 011001 opc:2 0 imm9 00 Rn Rt */
+    if ((insn & 0x3f200c00) != 0x19000000) return 0;
+    unsigned size = insn >> 30, opc = (insn >> 22) & 3;
+    unsigned rn = (insn >> 5) & 31, rt = insn & 31;
+    if ((opc == 2 && size == 3) || (opc == 3 && size >= 2)) return 0;   /* unallocated */
+    int64_t imm = (insn >> 12) & 0x1ff;
+    if (imm & 0x100) imm -= 0x200;
+    uintptr_t a = (uintptr_t)((rn == 31 ? ss->__sp : *gpr(ss, rn)) + imm);
+    uint64_t *reg = gpr(ss, rt);
+
+    if (opc == 0) {                            /* STLUR{B,H,} */
+        uint64_t v = reg ? *reg : 0;
+        switch (size) {
+        case 0: __atomic_store_n((uint8_t  *)a, (uint8_t)v,  __ATOMIC_RELEASE); break;
+        case 1: __atomic_store_n((uint16_t *)a, (uint16_t)v, __ATOMIC_RELEASE); break;
+        case 2: __atomic_store_n((uint32_t *)a, (uint32_t)v, __ATOMIC_RELEASE); break;
+        case 3: __atomic_store_n((uint64_t *)a, v,           __ATOMIC_RELEASE); break;
+        }
+    } else {                                   /* LDAPUR{B,H,,SB,SH,SW} */
+        uint64_t v = 0;
+        switch (size) {
+        case 0: v = __atomic_load_n((uint8_t  *)a, __ATOMIC_ACQUIRE); break;
+        case 1: v = __atomic_load_n((uint16_t *)a, __ATOMIC_ACQUIRE); break;
+        case 2: v = __atomic_load_n((uint32_t *)a, __ATOMIC_ACQUIRE); break;
+        case 3: v = __atomic_load_n((uint64_t *)a, __ATOMIC_ACQUIRE); break;
+        }
+        unsigned bits = 8u << size;
+        if (opc == 2)                          /* sign-extend into Xt */
+            v = (uint64_t)((int64_t)(v << (64 - bits)) >> (64 - bits));
+        else if (opc == 3)                     /* sign-extend into Wt */
+            v = (uint32_t)((int32_t)((uint32_t)v << (32 - bits)) >> (32 - bits));
+        if (reg) *reg = v;
+    }
+    ss->__pc += 4;
+    atomic_fetch_add_explicit(&g_emulated, 1, memory_order_relaxed);
+    return 1;
+}
+
+typedef __uint128_t v128;
+
+static inline uint64_t ror64(uint64_t x, unsigned r) { return (x >> r) | (x << (64 - r)); }
+
+/* SHA512H, SHA512H2, SHA512SU0, SHA512SU1 -- the ARM ARM pseudocode, with
+   [0] the low doubleword and [1] the high one. */
+static int emulate_sha512(v128 *v, uint32_t insn) {
+    unsigned rd = insn & 31, rn = (insn >> 5) & 31, rm = (insn >> 16) & 31;
+    uint64_t x[2], y[2], w[2], t[2];
+    memcpy(x, &v[rn], 16); memcpy(y, &v[rm], 16); memcpy(w, &v[rd], 16);
+
+    if ((insn & 0xfffffc00) == 0xcec08000) {                     /* SHA512SU0 Vd, Vn */
+        t[0] = w[0] + (ror64(w[1], 1) ^ ror64(w[1], 8) ^ (w[1] >> 7));
+        t[1] = w[1] + (ror64(x[0], 1) ^ ror64(x[0], 8) ^ (x[0] >> 7));
+    } else if ((insn & 0xffe0fc00) == 0xce608800) {              /* SHA512SU1 Vd, Vn, Vm */
+        t[1] = w[1] + (ror64(x[1], 19) ^ ror64(x[1], 61) ^ (x[1] >> 6)) + y[1];
+        t[0] = w[0] + (ror64(x[0], 19) ^ ror64(x[0], 61) ^ (x[0] >> 6)) + y[0];
+    } else if ((insn & 0xffe0fc00) == 0xce608000) {              /* SHA512H Qd, Qn, Vm */
+        uint64_t s1 = ror64(y[1], 14) ^ ror64(y[1], 18) ^ ror64(y[1], 41);
+        t[1] = ((y[1] & x[0]) ^ (~y[1] & x[1])) + s1 + w[1];
+        uint64_t tmp = t[1] + y[0];
+        s1 = ror64(tmp, 14) ^ ror64(tmp, 18) ^ ror64(tmp, 41);
+        t[0] = ((tmp & y[1]) ^ (~tmp & x[0])) + s1 + w[0];
+    } else if ((insn & 0xffe0fc00) == 0xce608400) {              /* SHA512H2 Qd, Qn, Vm */
+        uint64_t s0 = ror64(y[0], 28) ^ ror64(y[0], 34) ^ ror64(y[0], 39);
+        t[1] = ((x[0] & y[1]) ^ (x[0] & y[0]) ^ (y[1] & y[0])) + s0 + w[1];
+        s0 = ror64(t[1], 28) ^ ror64(t[1], 34) ^ ror64(t[1], 39);
+        t[0] = ((t[1] & y[0]) ^ (t[1] & y[1]) ^ (y[1] & y[0])) + s0 + w[0];
+    } else {
+        return 0;
+    }
+    memcpy(&v[rd], t, 16);
+    return 1;
+}
+
+static int emulate_simd(ucontext_t *uc, uint32_t insn) {
+    v128 *v = uc->uc_mcontext->__ns.__v;
+    unsigned rd = insn & 31, rn = (insn >> 5) & 31, rm = (insn >> 16) & 31, ra = (insn >> 10) & 31;
+
+    if (emulate_sha512(v, insn)) return 1;
+    if ((insn & 0xffe08000) == 0xce000000) { v[rd] = v[rn] ^ v[rm] ^ v[ra];    return 1; }  /* EOR3 */
+    if ((insn & 0xffe08000) == 0xce200000) { v[rd] = v[rn] ^ (v[rm] & ~v[ra]); return 1; }  /* BCAX */
+    if ((insn & 0xffe0fc00) == 0xce608c00 ||                                                 /* RAX1 */
+        (insn & 0xffe00000) == 0xce800000) {                                                 /* XAR  */
+        int xar = (insn >> 23) & 1;
+        unsigned rot = xar ? (insn >> 10) & 63 : 0;
+        uint64_t n[2], m[2], d[2];
+        memcpy(n, &v[rn], 16); memcpy(m, &v[rm], 16);
+        for (int i = 0; i < 2; i++) {
+            if (xar) { uint64_t x = n[i] ^ m[i]; d[i] = rot ? (x >> rot) | (x << (64 - rot)) : x; }
+            else     d[i] = n[i] ^ ((m[i] << 1) | (m[i] >> 63));
+        }
+        memcpy(&v[rd], d, 16);
+        return 1;
+    }
+
+    /* Q (bit 30) and U (bit 29) are operands, not part of the opcode. */
+    int vec  = (insn & 0x9fe0fc00) == 0x0e809400;                                            /* SDOT/UDOT */
+    int elem = (insn & 0x9fc0f400) == 0x0f80e000;                                            /* ...[index] */
+    if (vec || elem) {
+        int q = (insn >> 30) & 1, u = (insn >> 29) & 1;
+        unsigned idx = 0;
+        if (elem) {
+            idx = ((insn >> 11) & 1) << 1 | ((insn >> 21) & 1);   /* H:L */
+            rm  = (insn >> 16) & 31;                               /* M:Rm */
+        }
+        uint8_t n[16], m[16];
+        uint32_t d[4];
+        memcpy(n, &v[rn], 16); memcpy(m, &v[rm], 16); memcpy(d, &v[rd], 16);
+        for (int i = 0; i < (q ? 4 : 2); i++) {
+            int32_t s = 0;
+            for (int j = 0; j < 4; j++) {
+                unsigned a = 4 * i + j, b = elem ? 4 * idx + j : a;
+                s += u ? (int32_t)n[a] * (int32_t)m[b]
+                       : (int32_t)(int8_t)n[a] * (int32_t)(int8_t)m[b];
+            }
+            d[i] += (uint32_t)s;
+        }
+        if (!q) d[2] = d[3] = 0;
+        memcpy(&v[rd], d, 16);
+        return 1;
+    }
+    return 0;
+}
+
+static int emulate_system(ucontext_t *uc, uint32_t insn) {
+    if (insn == 0xd50330ff) return 1;                           /* SB: the trap already serialised */
+    if ((insn & 0xfffff0ff) == 0xd503405f) return 1;            /* MSR DIT, #imm: no DIT here */
+    if ((insn & 0xffffffe0) == 0xd51b42a0) return 1;            /* MSR DIT, Xt */
+    if ((insn & 0xffffffe0) == 0xd53b42a0) {                    /* MRS Xt, DIT: reads as off */
+        uint64_t *reg = gpr(&uc->uc_mcontext->__ss, insn & 31);
+        if (reg) *reg = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static void ill_fault(int sig, siginfo_t *si, void *ctx) {
+    ucontext_t *uc = ctx;
+    if (emulate_lrcpc2(uc)) return;
+    uint32_t insn = *(const uint32_t *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
+    if (emulate_simd(uc, insn) || emulate_system(uc, insn)) {
+        uc->uc_mcontext->__ss.__pc += 4;
+        atomic_fetch_add_explicit(&g_emulated, 1, memory_order_relaxed);
+        return;
+    }
+    chain(sig, si, ctx);
+}
+
 static void install_handler(int sig) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = jit_fault;
+    sa.sa_sigaction = sig == SIGILL ? ill_fault : jit_fault;
     /* SA_ONSTACK so that a chained handler still gets the alternate stack it
        asked for, which is what makes a stack overflow reportable. */
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
@@ -502,11 +681,12 @@ static void check_handlers(void) {
     static atomic_ulong calls;
     unsigned long c = atomic_fetch_add(&calls, 1);
     if (c > 16 && (c & 4095) != 0) return;
-    static const int sigs[2] = { SIGBUS, SIGSEGV };
-    for (int i = 0; i < 2; i++) {
+    static const int sigs[3] = { SIGBUS, SIGSEGV, SIGILL };
+    for (int i = 0; i < 3; i++) {
         struct sigaction cur;
         if (real_sigaction(sigs[i], NULL, &cur) != 0) continue;
-        if ((cur.sa_flags & SA_SIGINFO) && cur.sa_sigaction == jit_fault) continue;
+        if ((cur.sa_flags & SA_SIGINFO) &&
+            cur.sa_sigaction == (sigs[i] == SIGILL ? ill_fault : jit_fault)) continue;
         sig_lock();
         *app_slot(sigs[i]) = cur;
         sig_unlock();
@@ -537,9 +717,9 @@ void (*signal(int sig, void (*func)(int)))(int) {
 }
 
 static void report_counters(void) {
-    fprintf(stderr, "[node-ios] JIT faults: write %lu, exec %lu, waited %lu, chained %lu\n",
+    fprintf(stderr, "[node-ios] JIT faults: write %lu, exec %lu, waited %lu, chained %lu; emulated %lu\n",
             atomic_load(&g_write_faults), atomic_load(&g_exec_faults),
-            atomic_load(&g_waits), atomic_load(&g_chained));
+            atomic_load(&g_waits), atomic_load(&g_chained), atomic_load(&g_emulated));
 }
 
 /* Runs before section 6's constructor sets V8's flags, and before main. */
@@ -558,8 +738,10 @@ static void nodeios_jit_init(void) {
 
     real_sigaction(SIGBUS,  NULL, &g_app[0]);
     real_sigaction(SIGSEGV, NULL, &g_app[1]);
+    real_sigaction(SIGILL,  NULL, &g_app[2]);
     install_handler(SIGBUS);
     install_handler(SIGSEGV);
+    install_handler(SIGILL);
 
     if (debug_on()) atexit(report_counters);
 }
@@ -587,6 +769,23 @@ void syslog_darwin_extsn(int priority, const char *format, ...) {
     va_start(ap, format);
     vsyslog(priority, format, ap);
     va_end(ap);
+}
+
+/* ---- 8. std::__libcpp_verbose_abort ------------------------------------ */
+
+/* libc++'s hardened checks call this with a printf-style message just before
+   aborting. iOS 16's libc++ exports it; iOS 15's does not, and without it dyld
+   refuses to start Node at all ("Symbol not found", before main). Do what
+   libc++ itself does. */
+__attribute__((noreturn))
+void libcpp_verbose_abort(const char *format, ...) __asm__("__ZNSt3__122__libcpp_verbose_abortEPKcz");
+
+void libcpp_verbose_abort(const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    vfprintf(stderr, format, ap);
+    va_end(ap);
+    abort();
 }
 
 /* ---- 4. exec path remapping -------------------------------------------- */

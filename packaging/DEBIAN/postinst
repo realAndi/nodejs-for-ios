@@ -17,6 +17,13 @@ export PATH
 say() { print -- "nodejs: $*"; }
 die() { print -u2 -- "nodejs: ERROR: $*"; exit 1; }
 
+# " (exit 132, SIGILL)": a binary the kernel kills prints nothing of its own,
+# so the status is the only clue there is.
+exit_status() {
+    if (( $1 > 128 )); then print -r -- " (exit $1, SIG$signals[$1-127])"
+    else print -r -- " (exit $1)"; fi
+}
+
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
     else shasum -a 256 "$1" | cut -d' ' -f1; fi
@@ -34,6 +41,42 @@ command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
     || missing="$missing sha256sum"
 [ -z "$missing" ] || die "missing required tool(s):$missing
 On a Procursus bootstrap: sudo apt install zsh coreutils curl tar gzip python3 ldid"
+
+# The binary is the official macOS build, compiled for M1-class CPUs. An
+# A12-class chip (iPhone XS/XR, iPad Pro 2018/2020, iPad Air 3, iPad mini 5,
+# iPad 8th gen) lacks a few of the instructions it uses; the shim emulates
+# those, which works but is new. Anything older also lacks ones it uses
+# thousands of times over -- atomics, load-acquire, JavaScript's float
+# conversion -- and would die of SIGILL before printing a word, so say so now,
+# before the download. Only a definite 0 from the kernel counts: iOS 15 has no
+# sysctl for some features, and a missing one is not evidence of anything.
+cpu=$(python3 - <<'EOF' 2>/dev/null
+import ctypes
+libc = ctypes.CDLL(None)
+def feature(name):
+    v = ctypes.c_int(-1)
+    n = ctypes.c_size_t(ctypes.sizeof(v))
+    ok = libc.sysctlbyname(("hw.optional.arm." + name).encode(),
+                           ctypes.byref(v), ctypes.byref(n), None, 0) == 0
+    return v.value if ok else -1
+model = ctypes.create_string_buffer(64)
+n = ctypes.c_size_t(64)
+libc.sysctlbyname(b"hw.machine", model, ctypes.byref(n), None, 0)
+lacking = [f for f in ("FEAT_LSE", "FEAT_LRCPC", "FEAT_JSCVT") if feature(f) == 0]
+tier = "unsupported" if lacking else "a12" if feature("FEAT_LRCPC2") == 0 else "ok"
+print(model.value.decode() or "this-device", tier, *lacking)
+EOF
+) || cpu=""   # a check that cannot run must not stop the install
+case "$cpu" in
+    *" unsupported"*)
+        die "this device (${cpu%% *}) cannot run Node.js: its CPU lacks${cpu#* unsupported}.
+Node.js needs an A12 chip or newer: iPhone XS/XR or later; on iPad, the
+2018 iPad Pro, iPad Air 3, iPad mini 5, iPad 8th generation, or later." ;;
+    *" a12")
+        say "NOTE: ${cpu%% *} has an A12-class CPU. Node.js runs on it by emulating"
+        say "  a few newer CPU instructions. Support is experimental -- some errors"
+        say "  can occur. Please report them." ;;
+esac
 
 # ~50MB download, ~220MB unpacked, plus the patched copy while it is staged.
 # Field 4 of df's POSIX output is the free space in KB. Split it out in zsh, not
@@ -103,7 +146,7 @@ chmod 644 "$SRC/lib/node_modules/npm/npmrc"
 
 say "verifying"
 out=$("$SRC/bin/node" -e 'console.log(process.version + " " + process.platform + "/" + process.arch)' 2>&1) \
-    || die "patched binary did not run: $out"
+    || { rc=$?; die "patched binary did not run$(exit_status $rc): $out"; }
 case "$out" in
     v$NODE_VERSION*) say "verified: $out" ;;
     *) die "unexpected version output: $out" ;;
@@ -137,7 +180,7 @@ done
 # Final check against the installed layout, not the staging directory. Cheap,
 # and it is the only thing that proves what the user will actually run.
 out=$("$BIN/node" -e 'console.log(process.version)' 2>&1) \
-    || die "installed binary does not run: $out"
+    || { rc=$?; die "installed binary does not run$(exit_status $rc): $out"; }
 npm_version=$("$BIN/npm" --version 2>&1) \
     || die "npm does not run through its launcher: $npm_version"
 

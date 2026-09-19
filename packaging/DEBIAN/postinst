@@ -27,7 +27,7 @@ sha256_of() {
 # this bootstrap -- both worth failing on now, with the name, rather than
 # part-way through a 50MB download.
 missing=""
-for tool in curl tar gzip python3 ldid df awk mktemp install; do
+for tool in curl tar gzip python3 ldid df mktemp install tail cut; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
@@ -36,7 +36,11 @@ command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
 On a Procursus bootstrap: sudo apt install zsh coreutils curl tar gzip python3 ldid"
 
 # ~50MB download, ~220MB unpacked, plus the patched copy while it is staged.
-avail=$(df -k "$LIB" | tail -1 | awk '{print $4}')
+# Field 4 of df's POSIX output is the free space in KB. Split it out in zsh, not
+# awk: awk is only a virtual package on Procursus (gawk or mawk), not in every
+# bootstrap, and this was its one use -- an iPad without it refused to install.
+df_fields=( $(df -Pk "$LIB" | tail -1) )
+avail=$df_fields[4]
 [ "${avail:-0}" -gt 600000 ] || die "need ~600MB free under $LIB, have $((avail/1024))MB"
 
 # Stage inside $LIB rather than /tmp. The sandbox refuses to mmap() a dylib out
